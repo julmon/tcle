@@ -1,0 +1,5 @@
+# TCLE extension
+comment = 'Transparent Cell-Level Encryption'
+default_version = '1.0'
+module_pathname = '$libdir/tcle'
+relocatable = true

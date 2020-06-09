@@ -1,0 +1,88 @@
+/* tcle/tcle--1.0.sql */
+
+-- complain if script is sourced in psql, rather than via CREATE EXTENSION
+\echo Use "CREATE EXTENSION tcle" to load this file. \quit
+
+CREATE TYPE encrypt_text;
+CREATE TYPE encrypt_numeric;
+CREATE TYPE encrypt_timestamptz;
+
+CREATE FUNCTION encrypt_text_in(cstring)
+RETURNS encrypt_text
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+CREATE FUNCTION encrypt_text_out(encrypt_text)
+RETURNS cstring
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+CREATE TYPE encrypt_text (
+  INPUT=encrypt_text_in,
+  OUTPUT=encrypt_text_out,
+  STORAGE=plain
+);
+
+CREATE CAST (ENCRYPT_TEXT AS TEXT) WITH INOUT AS IMPLICIT;
+CREATE CAST (TEXT AS ENCRYPT_TEXT) WITH INOUT AS IMPLICIT;
+
+CREATE FUNCTION encrypt_numeric_in(cstring)
+RETURNS encrypt_numeric
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+CREATE FUNCTION encrypt_numeric_out(encrypt_numeric)
+RETURNS cstring
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+CREATE TYPE encrypt_numeric (
+  INPUT=encrypt_numeric_in,
+  OUTPUT=encrypt_numeric_out
+);
+
+CREATE CAST (ENCRYPT_NUMERIC AS NUMERIC) WITH INOUT AS IMPLICIT;
+CREATE CAST (NUMERIC AS ENCRYPT_NUMERIC) WITH INOUT AS IMPLICIT;
+CREATE CAST (INTEGER AS ENCRYPT_NUMERIC) WITH INOUT AS IMPLICIT;
+
+CREATE FUNCTION encrypt_timestamptz_in(cstring)
+RETURNS encrypt_timestamptz
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+CREATE FUNCTION encrypt_timestamptz_out(encrypt_timestamptz)
+RETURNS cstring
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+CREATE TYPE encrypt_timestamptz (
+  INPUT=encrypt_timestamptz_in,
+  OUTPUT=encrypt_timestamptz_out
+);
+
+CREATE CAST (ENCRYPT_TIMESTAMPTZ AS TIMESTAMPTZ) WITH INOUT AS IMPLICIT;
+CREATE CAST (ENCRYPT_TIMESTAMPTZ AS DATE) WITH INOUT AS IMPLICIT;
+CREATE CAST (TIMESTAMPTZ AS ENCRYPT_TIMESTAMPTZ) WITH INOUT AS IMPLICIT;
+
+CREATE FUNCTION tcle_set_passphrase(text)
+RETURNS BOOLEAN
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION tcleam_handler(internal)
+RETURNS table_am_handler
+AS 'MODULE_PATHNAME'
+LANGUAGE C;
+
+-- Table Access Method
+CREATE ACCESS METHOD tcleam TYPE TABLE HANDLER tcleam_handler;
+COMMENT ON ACCESS METHOD tcleam IS 'Transparent Cell-Level Encryption';
+
+CREATE TABLE tcle_table_keys(
+  nspname NAME NOT NULL,
+  relname NAME NOT NULL,
+  cipher_key BYTEA,
+  PRIMARY KEY(nspname, relname)
+);
+COMMENT ON TABLE tcle_table_keys IS
+'Transparent Cell-Level Encryption internal table';
