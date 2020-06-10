@@ -86,8 +86,6 @@ Due to its experimental status, there are some limitations:
 
   * DO NOT USE IT IN PRODUCTION.
   * No support for key rotation.
-  * Lack of operators and implicit casts for these new data types, some
-    explicit casts are still needed.
   * Master key passphrase could leak in PostgreSQL logs.
 
 Concept limitations:
