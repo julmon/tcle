@@ -37,6 +37,7 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_type.h"
 #include "common/sha2.h"
+#include "commands/dbcommands.h"
 #include "commands/progress.h"
 #include "libpq/pqformat.h"
 #include "storage/ipc.h"
@@ -136,7 +137,7 @@ tcle_shmem_startup(void)
 	/* Create or attach to the shared memory state */
 	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
 
-	/* Storage file access lock */
+	/* Master keys htab lock */
 	shmmasterkeyslock = ShmemInitStruct("tcle master keys htable lock",
 										sizeof(shmmasterkeyslock),
 										&found);
@@ -220,6 +221,7 @@ tcle_ProcessUtility(PlannedStmt *pstmt,
 {
 	Node		   *parsetree = pstmt->utilityStmt;
 	List		   *actions = NIL;
+
 
 	switch (nodeTag(parsetree))
 	{
@@ -357,6 +359,36 @@ tcle_ProcessUtility(PlannedStmt *pstmt,
 					&& strcmp(stmt->into->accessMethod, "tcleam") == 0)
 				ereport(ERROR,
 						(errmsg("tcle: CREATE TABLE AS not supported for now")));
+			break;
+		}
+
+		case T_DropdbStmt:
+		{
+			/*
+			 * Handler DROP DATABASE. In this case, we just have to remove the
+			 * key from shmem htab if exists.
+			 */
+			DropdbStmt *stmt;
+			Oid			dbid;
+
+			stmt = (DropdbStmt *) parsetree;
+
+			/*
+			 * Get database oid by its name and let standard_ProcessUtility()
+			 * handle the error if not exists or the user is not the owner.
+			 */
+			dbid = get_database_oid(stmt->dbname, true);
+
+			if (!OidIsValid(dbid))
+				break;
+
+			if (!pg_database_ownercheck(dbid, GetUserId()))
+				break;
+
+			/*
+			 * Remove the entry from master keys htab if exists.
+			 */
+			RemoveDatabaseMasterKey(shmmasterkeyslock, shmmasterkeys, dbid);
 			break;
 		}
 
