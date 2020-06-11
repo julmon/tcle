@@ -38,6 +38,7 @@
 #include "catalog/pg_type.h"
 #include "common/sha2.h"
 #include "commands/progress.h"
+#include "libpq/pqformat.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
 #include "storage/bufmgr.h"
@@ -86,10 +87,16 @@ static void tcle_ProcessUtility(PlannedStmt *pstmt,
 PG_FUNCTION_INFO_V1(tcleam_handler);
 PG_FUNCTION_INFO_V1(encrypt_text_in);
 PG_FUNCTION_INFO_V1(encrypt_text_out);
+PG_FUNCTION_INFO_V1(encrypt_text_recv);
+PG_FUNCTION_INFO_V1(encrypt_text_send);
 PG_FUNCTION_INFO_V1(encrypt_numeric_in);
 PG_FUNCTION_INFO_V1(encrypt_numeric_out);
+PG_FUNCTION_INFO_V1(encrypt_numeric_recv);
+PG_FUNCTION_INFO_V1(encrypt_numeric_send);
 PG_FUNCTION_INFO_V1(encrypt_timestamptz_in);
 PG_FUNCTION_INFO_V1(encrypt_timestamptz_out);
+PG_FUNCTION_INFO_V1(encrypt_timestamptz_recv);
+PG_FUNCTION_INFO_V1(encrypt_timestamptz_send);
 PG_FUNCTION_INFO_V1(tcle_set_passphrase);
 
 void
@@ -459,8 +466,46 @@ encrypt_text_in(PG_FUNCTION_ARGS)
 Datum
 encrypt_text_out(PG_FUNCTION_ARGS)
 {
-	Datum		txt = PG_GETARG_DATUM(0);
-	PG_RETURN_CSTRING(TextDatumGetCString(txt));
+	/*
+	 * Ne need to go with DirectFunctionCall here, just call text type out
+	 * function with fcinfo.
+	 */
+	return textout(fcinfo);
+}
+
+/*
+ * Converts external binary format to encrypt_text
+ */
+Datum
+encrypt_text_recv(PG_FUNCTION_ARGS)
+{
+	StringInfo  buf = (StringInfo) PG_GETARG_POINTER(0);
+	text	   *result;
+	char	   *str;
+	int			nbytes;
+
+	str = pq_getmsgtext(buf, buf->len - buf->cursor, &nbytes);
+
+	if (nbytes > 2048)
+	{
+		pfree(str);
+		ereport(ERROR,
+				(errmsg("tcle: value too long for type encrypt_text, maximum "
+						"allowed size is 2048 bytes")));
+	}
+
+	result = cstring_to_text_with_len(str, nbytes);
+	pfree(str);
+	PG_RETURN_TEXT_P(result);
+}
+
+/*
+ * Converts encrypt_text to external binary format
+ */
+Datum
+encrypt_text_send(PG_FUNCTION_ARGS)
+{
+	return textsend(fcinfo);
 }
 
 /*
@@ -479,6 +524,24 @@ Datum
 encrypt_numeric_out(PG_FUNCTION_ARGS)
 {
 	return numeric_out(fcinfo);
+}
+
+/*
+ * Converts external binary format to encrypt_numeric
+ */
+Datum
+encrypt_numeric_recv(PG_FUNCTION_ARGS)
+{
+	return numeric_recv(fcinfo);
+}
+
+/*
+ * Converts encrypt_numeric to external binary format
+ */
+Datum
+encrypt_numeric_send(PG_FUNCTION_ARGS)
+{
+	return numeric_send(fcinfo);
 }
 
 /*
@@ -507,6 +570,30 @@ encrypt_timestamptz_out(PG_FUNCTION_ARGS)
 
 	int64_tstz = DirectFunctionCall1(numeric_int8, NumericGetDatum(num_tstz));
 	return DirectFunctionCall1(timestamptz_out, int64_tstz);
+}
+
+/*
+ * Converts external binary format to encrypt_timestamptz
+ */
+Datum
+encrypt_timestamptz_recv(PG_FUNCTION_ARGS)
+{
+	Datum		tstz = timestamptz_recv(fcinfo);
+
+	return DirectFunctionCall1(int8_numeric, DatumGetTimestampTz(tstz));
+}
+
+/*
+ * Converts encrypt_timestamptz to external binary format
+ */
+Datum
+encrypt_timestamptz_send(PG_FUNCTION_ARGS)
+{
+	Numeric		num_tstz = PG_GETARG_NUMERIC(0);
+	Datum		int64_tstz;
+
+	int64_tstz = DirectFunctionCall1(numeric_int8, NumericGetDatum(num_tstz));
+	return DirectFunctionCall1(timestamptz_send, int64_tstz);
 }
 
 /*
