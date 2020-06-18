@@ -48,6 +48,7 @@
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/fmgrprotos.h"
+#include "utils/memutils.h"
 #include "utils/numeric.h"
 #include "utils/syscache.h"
 
@@ -56,6 +57,16 @@
 #include "kms.h"
 
 PG_MODULE_MAGIC;
+
+/* Number of encryptable data types */
+#define N_ENCRYPT_TYPES		3
+#define IS_ENCRYPTABLE_TYPE(OID, ARRAY) \
+	(OID == ARRAY[0] || OID == ARRAY[1] || OID == ARRAY[2])
+
+/* Array of encryptable data type names currently implemented */
+static const char *encrypt_types[N_ENCRYPT_TYPES] = {"encrypt_text",
+													 "encrypt_numeric",
+													 "encrypt_timestamptz"};
 
 /* Saved hook values in case of unload */
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
@@ -71,6 +82,13 @@ extern Datum encrypt_text_out(PG_FUNCTION_ARGS);
 extern Datum tcle_set_passphrase(PG_FUNCTION_ARGS);
 
 static bool RelationAMIsTcleam(Oid relid);
+static HeapTuple EncryptDecryptHeapTuple(HeapTuple tuple, TupleDesc tupleDesc,
+										 Oid tableId, int8 flag,
+										 unsigned char *table_key,
+										 Oid *type_oids);
+static void LoadTableKey(Oid databaseId, Oid tableId,
+						 unsigned char **table_keyPtr);
+static void get_encrypt_type_oids(Oid **oidsPtr);
 
 void _PG_init(void);
 void _PG_fini(void);
@@ -221,7 +239,6 @@ tcle_ProcessUtility(PlannedStmt *pstmt,
 {
 	Node		   *parsetree = pstmt->utilityStmt;
 	List		   *actions = NIL;
-
 
 	switch (nodeTag(parsetree))
 	{
@@ -688,54 +705,51 @@ tcle_set_passphrase(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Load encryptable types Oids into input array.
+ */
+static void
+get_encrypt_type_oids(Oid ** oidsPtr)
+{
+	Oid		namespaceId;
+
+	/*
+	 * FIXME: types Oid look up is done for "public" schema only, meaning that
+	 * if the extension is created within another schema, this lookup will
+	 * fail.
+	 */
+	namespaceId = get_namespace_oid("public", true);
+
+	for (int i = 0; i < N_ENCRYPT_TYPES; i++)
+	{
+		(*oidsPtr)[i] = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid,
+									  PointerGetDatum(encrypt_types[i]),
+									  ObjectIdGetDatum(namespaceId));
+	}
+}
+
+/*
  * Encrypt / decrypt tuple attributes from a TupleTableSlot.
  */
-static void EncryptDecryptTupleTableSlot(TupleTableSlot *slot, int8 flag)
+static void
+EncryptDecryptTupleTableSlot(TupleTableSlot *slot, int8 flag)
 {
 	/* Number of attributes (columns) */
 	int				natts;
-	/*
-	 * Number of attributes corresponding to a candidate type for encryption /
-	 * decryption
-	 */
-	int				natts_c_cryp = 0;
-	/*
-	 * Number of attributes that really have to be encrypted / decrypted,
-	 * excluding null values
-	 */
-	int				natts_r_cryp = 0;
-	/* encrypt_* type and namespace ids */
-	Oid				encrypt_text_oid, encrypt_numeric_oid,
-					encrypt_timestamptz_oid;
-
-	Oid				namespace_oid;
+	bool			found_encrypt_type = false;
 	/* Variables for tuple manipulation */
 	HeapTuple		tuple, new_tuple;
-	BufferHeapTupleTableSlot *hslot;
-
-	Datum		   *replvals;
-	bool		   *replnuls;
-	int			   *replcols;
-	int				pos = 0;
+	bool			shouldFreeTuple;
 	unsigned char  *table_key;
-	bytea		   *table_cipher_key;
+	Oid			   *type_oids;
+	BufferHeapTupleTableSlot *bslot;
+	MemoryContext	oldContext;
+
+	/* Get encryptable data types Oids */
+	type_oids = (Oid *) palloc(N_ENCRYPT_TYPES * sizeof(Oid));
+	get_encrypt_type_oids(&type_oids);
 
 	natts = slot->tts_tupleDescriptor->natts;
 
-	/* Get type Oid by its name and namespace */
-	namespace_oid = get_namespace_oid("public", true);
-	encrypt_text_oid = GetSysCacheOid2(TYPENAMENSP,
-									   Anum_pg_type_oid,
-									   PointerGetDatum("encrypt_text"),
-									   ObjectIdGetDatum(namespace_oid));
-	encrypt_numeric_oid = GetSysCacheOid2(TYPENAMENSP,
-										  Anum_pg_type_oid,
-										  PointerGetDatum("encrypt_numeric"),
-										  ObjectIdGetDatum(namespace_oid));
-	encrypt_timestamptz_oid = GetSysCacheOid2(TYPENAMENSP,
-											  Anum_pg_type_oid,
-											  PointerGetDatum("encrypt_timestamptz"),
-											  ObjectIdGetDatum(namespace_oid));
 	/*
 	 * Quick attributes list lookup to see if any value should be encrypted /
 	 * decrypted later. We need to know maximum number of attributes we will
@@ -746,75 +760,125 @@ static void EncryptDecryptTupleTableSlot(TupleTableSlot *slot, int8 flag)
 	{
 		Form_pg_attribute att = TupleDescAttr(slot->tts_tupleDescriptor, i);
 
-		if (att->atttypid == encrypt_text_oid
-				|| att->atttypid == encrypt_numeric_oid
-				|| att->atttypid == encrypt_timestamptz_oid)
-			natts_c_cryp++;
+		if (IS_ENCRYPTABLE_TYPE(att->atttypid, type_oids))
+		{
+			found_encrypt_type = true;
+			break;
+		}
 	}
 
-	if (natts_c_cryp == 0)
+	if (!found_encrypt_type)
+	{
+		/* No encryptable data ? Just exit. */
+		pfree(type_oids);
 		return;
+	}
+
+	/* Load table's key */
+	table_key = (unsigned char *) palloc(AES_KEYLEN);
+	LoadTableKey(MyDatabaseId, slot->tts_tableOid, &table_key);
 
 	/* Fetch tuple from the slot */
-	hslot = (BufferHeapTupleTableSlot *) slot;
-	tuple = slot->tts_ops->get_heap_tuple(slot);
+	bslot = (BufferHeapTupleTableSlot *) slot;
+	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFreeTuple);
 
-	table_key = (unsigned char *) palloc(AES_KEYLEN);
+	/* Tuple encryption / decryption */
+	new_tuple = EncryptDecryptHeapTuple(tuple, slot->tts_tupleDescriptor,
+										slot->tts_tableOid, flag, table_key,
+										type_oids);
 
-	/*
-	 * Shared memory lookup for table's key. If not found then we have to load
-	 * the master key and fetch table's cipher key from KMS table and finally
-	 * push the table's key in shared memory.
-	 */
-	if (!CacheGetRelationKey(shmkeycache, MyDatabaseId, slot->tts_tableOid,
-							 &table_key))
-	{
-		unsigned char	*master_key;
-		master_key = (unsigned char *) palloc(AES_KEYLEN);
+	/* The Slot has been materialized, so we can free the buffer tuple */
+	heap_freetuple(bslot->base.tuple);
 
-		/* Get master key from shared memory */
-		if (!GetDatabaseMasterKey(shmmasterkeyslock, shmmasterkeys,
-								  MyDatabaseId, &master_key))
-			ereport(ERROR,
-					(errmsg("tcle: master key not found for this database")));
+	/* Tuple duplication into TTS memory context */
+	oldContext = MemoryContextSwitchTo(slot->tts_mcxt);
+	bslot->base.tuple = heap_copytuple(new_tuple);
+	MemoryContextSwitchTo(oldContext);
 
-		table_cipher_key = (bytea *) palloc(AES_IVLEN + AES_KEYLEN
-											+ AES_BLOCKLEN);
-		/* Load and decrypt table's key */
-		if (!GetKMSCipherKey(slot->tts_tableOid, &table_cipher_key))
-			ereport(ERROR, (errmsg("tcle: could not get table's key")));
+	/* Copy ctid and flag the TTS */
+	slot->tts_tid = new_tuple->t_self;
+	slot->tts_flags |= TTS_FLAG_SHOULDFREE;
 
-		if (!DecryptKMSCipherKey(table_cipher_key, master_key, &table_key))
-			ereport(ERROR,
-					(errmsg("tcle: could not decrypt table's cipher key")));
+	if (shouldFreeTuple)
+		heap_freetuple(tuple);
+	heap_freetuple(new_tuple);
+	pfree(table_key);
+	pfree(type_oids);
+}
 
-		pfree(table_cipher_key);
+/*
+ * Shared memory lookup for table's key. If not found then we have to load
+ * the master key and fetch table's cipher key from KMS table and finally
+ * push the table's key in shared memory.
+ */
+static void
+LoadTableKey(Oid databaseId, Oid tableId, unsigned char **table_keyPtr)
+{
+	unsigned char  *master_key;
+	bytea		   *table_cipher_key;
 
-		/* Add table's key in shared memory */
-		CacheAddRelationKey(shmkeycache, MyDatabaseId, slot->tts_tableOid,
-							table_key);
-	}
+	if (CacheGetRelationKey(shmkeycache, databaseId, tableId, table_keyPtr))
+		return;
 
-	/* Allocate memory for the attributes we'll have to encrypt / decrypt */
-	replvals = (Datum *) palloc(sizeof(Datum) *natts_c_cryp);
-	replnuls = (bool *) palloc(sizeof(bool) *natts_c_cryp);
-	replcols = (int *) palloc(sizeof(int) *natts_c_cryp);
+	master_key = (unsigned char *) palloc(AES_KEYLEN);
+
+	/* Get master key from shared memory */
+	if (!GetDatabaseMasterKey(shmmasterkeyslock, shmmasterkeys, databaseId,
+							  &master_key))
+		ereport(ERROR,
+				(errmsg("tcle: master key not found for this database")));
+
+	table_cipher_key = (bytea *) palloc(AES_IVLEN + AES_KEYLEN + AES_BLOCKLEN);
+
+	/* Load and decrypt table's key */
+	if (!GetKMSCipherKey(tableId, &table_cipher_key))
+		ereport(ERROR, (errmsg("tcle: could not get table's key")));
+
+	if (!DecryptKMSCipherKey(table_cipher_key, master_key, table_keyPtr))
+		ereport(ERROR, (errmsg("tcle: could not decrypt table's cipher key")));
+
+	pfree(table_cipher_key);
+	pfree(master_key);
+
+	/* Add table's key in shared memory */
+	CacheAddRelationKey(shmkeycache, databaseId, tableId, *table_keyPtr);
+}
+
+static HeapTuple
+EncryptDecryptHeapTuple(HeapTuple tuple, TupleDesc tupleDesc, Oid tableId,
+						int8 flag, unsigned char *table_key, Oid *type_oids)
+{
+	/* Variables for tuple manipulation */
+	HeapTuple		new_tuple;
+
+	Datum		   *values, *new_values;
+	bool		   *isnull;
+	MemoryContext	oldcontext, tmpcontext;
+
+	/* Let's do encryption / decryption in a dedicated memory context */
+	tmpcontext = AllocSetContextCreate(CurrentMemoryContext,
+									   "TCLE crypt tuple",
+									   ALLOCSET_DEFAULT_SIZES);
+	oldcontext = MemoryContextSwitchTo(tmpcontext);
+
+	values = (Datum *) palloc(sizeof(Datum) * tupleDesc->natts);
+	isnull = (bool *) palloc(sizeof(bool) * tupleDesc->natts);
+	new_values = (Datum *) palloc(sizeof(Datum) * tupleDesc->natts);
+
+	/* Extract tuple values and nulls */
+	heap_deform_tuple(tuple, tupleDesc, values, isnull);
 
 	/*
 	 * Loop through tuple descriptor attributes looking for ENCRYPT_* types
 	 * and apply encrypt/decrypt on attribute value if not null.
 	 */
-	for (int i=0; i < natts; i++)
+	for (int i=0; i < tupleDesc->natts; i++)
 	{
-		bool				isNull;
-		Datum				attVal;
-		/* Attribute value copy used for decryption */
-		Datum				attValCpy;
 		/*
 		 * plaintext / ciphertext length returned by AES decryption /
 		 * encryption functions.
 		 */
-		int					crypt_len;
+		int				crypt_len;
 		/*
 		 * Char buffer where encryption / decryption results will be stored.
 		 * To avoid further extra memory allocation, this buffer will be
@@ -841,36 +905,30 @@ static void EncryptDecryptTupleTableSlot(TupleTableSlot *slot, int8 flag)
 		 * ciphertext / plaintext size that AES encryption / decrytion function
 		 * returns.
 		 */
-		char			   *crypt_buffer;
+		char		   *crypt_buffer = NULL;
 		/* Input plaintext / ciphertext length */
-		int					buffer_len;
+		int				buffer_len;
 		/* AES initialization vector */
-		unsigned char		iv[AES_IVLEN];
+		unsigned char	iv[AES_IVLEN];
+		unsigned char  *att_buffer;
 		/* Tuple attribute description */
-		Form_pg_attribute	att = TupleDescAttr(slot->tts_tupleDescriptor,
-												 i);
-		unsigned char	   *att_buffer;
+		Form_pg_attribute att = TupleDescAttr(tupleDesc, i);
 
-		if (att->atttypid != encrypt_text_oid
-				&& att->atttypid != encrypt_numeric_oid
-				&& att->atttypid != encrypt_timestamptz_oid)
-			/* Not encrypt_text type */
+		if (!IS_ENCRYPTABLE_TYPE(att->atttypid, type_oids) || isnull[i])
+		{
+			/* Not encryptable type or null value*/
+			new_values[i] = values[i];
 			continue;
+		}
 
-		attVal = heap_getattr(tuple, i+1, slot->tts_tupleDescriptor,
-							  &isNull);
-
-		if (isNull)
-			/* No need to encrypt/decrypt null value */
-			continue;
+		att_buffer = (unsigned char *) VARDATA_ANY(values[i]);
+		buffer_len = (int) VARSIZE_ANY_EXHDR(values[i]);
 
 		if (flag == AES_ENCRYPT_FLAG)
 		{
 			/*
 			 * Encryption part
 			 */
-			att_buffer = (unsigned char *) VARDATA_ANY(attVal);
-			buffer_len = (int) VARSIZE_ANY_EXHDR(attVal);
 			crypt_buffer = (char *) palloc(buffer_len + AES_BLOCKLEN
 										   + AES_IVLEN + VARHDRSZ);
 
@@ -879,9 +937,9 @@ static void EncryptDecryptTupleTableSlot(TupleTableSlot *slot, int8 flag)
 			 * crypt_buffer
 			 */
 			if (!pg_strong_random(iv, AES_IVLEN))
-				ereport(ERROR,
-						(errmsg("tcle: could not generate random AES IV")));
+				goto error_rng;
 
+			/* Store AES IV */
 			memcpy(VARDATA(crypt_buffer), iv, AES_IVLEN);
 
 			/* AES encryption */
@@ -892,29 +950,20 @@ static void EncryptDecryptTupleTableSlot(TupleTableSlot *slot, int8 flag)
 										(unsigned char *) VARDATA(crypt_buffer)
 										+ AES_IVLEN);
 			if (crypt_len == -1)
-				ereport(ERROR,(errmsg("tcle: could not encrypt data")));
+				goto error_encrypt;
 
 			/* Set Datum size to the right size */
 			SET_VARSIZE(crypt_buffer, crypt_len + VARHDRSZ + AES_IVLEN);
-
 		}
 		else if (flag == AES_DECRYPT_FLAG)
 		{
 			/*
 			 * Decryption part
 			 */
-
-			/*
-			 * No need to detoast, we work only with plain storage
-			 */
-			attValCpy = datumCopy(attVal, att->attbyval, att->attlen);
-			att_buffer = (unsigned char *) VARDATA_ANY(attValCpy);
+			crypt_buffer = (char *) palloc(buffer_len + VARHDRSZ - AES_IVLEN);
 
 			/* Get AES IV */
 			memcpy(iv, att_buffer, AES_IVLEN);
-
-			buffer_len = (int) VARSIZE_ANY_EXHDR(attValCpy);
-			crypt_buffer = (char *) palloc(buffer_len + VARHDRSZ - AES_IVLEN);
 
 			/* AES decryption */
 			crypt_len = AES_CBC_decrypt(att_buffer + AES_IVLEN,
@@ -923,38 +972,54 @@ static void EncryptDecryptTupleTableSlot(TupleTableSlot *slot, int8 flag)
 										iv,
 										(unsigned char *) VARDATA(crypt_buffer));
 			if (crypt_len == -1)
-				ereport(ERROR,(errmsg("tcle: could not decrypt data")));
+				goto error_decrypt;
 
 			SET_VARSIZE(crypt_buffer, crypt_len + VARHDRSZ);
 		}
 
-		replvals[pos] = PointerGetDatum(crypt_buffer);
-		replnuls[pos] = isNull;
-		replcols[pos] = i + 1;
-
-		pos++;
-		natts_r_cryp++;
+		new_values[i] = PointerGetDatum(crypt_buffer);
 	}
 
-	/* Apply modifications on the tuple */
-	new_tuple = heap_modify_tuple_by_cols(tuple, slot->tts_tupleDescriptor,
-										  natts_r_cryp, replcols, replvals,
-										  replnuls);
+	MemoryContextSwitchTo(oldcontext);
+
+	/* Build a new tuple with updated (encrypted / decrypted) fields */
+	new_tuple = heap_form_tuple(tupleDesc, new_values, isnull);
 
 	/* Copy original tuple transaction informations */
 	memcpy(&new_tuple->t_data->t_choice.t_heap,
 		   &tuple->t_data->t_choice.t_heap,
 		   sizeof(HeapTupleFields));
+	memcpy(&new_tuple->t_data->t_choice.t_datum,
+		   &tuple->t_data->t_choice.t_datum,
+		   sizeof(DatumTupleFields));
+	new_tuple->t_data->t_infomask2 = tuple->t_data->t_infomask2;
+	new_tuple->t_data->t_infomask = tuple->t_data->t_infomask;
+	new_tuple->t_data->t_hoff = tuple->t_data->t_hoff;
+	new_tuple->t_data->t_ctid = tuple->t_data->t_ctid;
+	memcpy(new_tuple->t_data->t_bits,
+		   tuple->t_data->t_bits,
+		   BITMAPLEN(HeapTupleHeaderGetNatts(tuple->t_data)));
+	new_tuple->t_self = tuple->t_self;
+	new_tuple->t_tableOid = tuple->t_tableOid;
 
-	/* If TTS is a buffer slot, let's conserve original Buffer. */
-	if (BufferIsValid(hslot->buffer))
-		ExecStoreBufferHeapTuple(new_tuple, slot, hslot->buffer);
-	else
-		ExecForceStoreHeapTuple(new_tuple, slot, false);
+	MemoryContextDelete(tmpcontext);
 
-	pfree(replvals);
-	pfree(replnuls);
-	pfree(replcols);
+	return new_tuple;
+
+error_rng:
+	MemoryContextSwitchTo(oldcontext);
+	MemoryContextDelete(tmpcontext);
+	ereport(ERROR, (errmsg("tcle: could not generate random AES IV")));
+
+error_encrypt:
+	MemoryContextSwitchTo(oldcontext);
+	MemoryContextDelete(tmpcontext);
+	ereport(ERROR, (errmsg("tcle: could not encrypt data")));
+
+error_decrypt:
+	MemoryContextSwitchTo(oldcontext);
+	MemoryContextDelete(tmpcontext);
+	ereport(ERROR, (errmsg("tcle: could not decrypt data")));
 }
 
 /* ------------------------------------------------------------------------
