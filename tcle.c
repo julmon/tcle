@@ -48,6 +48,7 @@
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/fmgrprotos.h"
+#include "utils/memutils.h"
 #include "utils/numeric.h"
 #include "utils/syscache.h"
 
@@ -57,20 +58,60 @@
 
 PG_MODULE_MAGIC;
 
+/* Number of encryptable data types */
+#define N_ENCRYPT_TYPES		3
+#define IS_ENCRYPTABLE_TYPE(OID, ARRAY) \
+	(OID == ARRAY[0] || OID == ARRAY[1] || OID == ARRAY[2])
+
+/*
+ * UtilityCryptFlag* struct are used to store in a htab (local to backend) a
+ * flag related to current command. This flag will allow to disable encryption
+ * / decryption for some utility statements like VACUUM FULL or CLUSTER.
+ */
+typedef struct UtilityCryptFlagKey {
+	TransactionId	xid; /* Current Transaction ID */
+	CommandId		cid; /* Command ID */
+} UtilityCryptFlagKey;
+
+typedef struct UtilityCryptFlagEntry {
+	UtilityCryptFlagKey key;
+	int8			flag;
+} UtilityCryptFlagEntry;
+
+/* Array of encryptable data type names currently implemented */
+static const char *encrypt_types[N_ENCRYPT_TYPES] = {"encrypt_text",
+													 "encrypt_numeric",
+													 "encrypt_timestamptz"};
+
 /* Saved hook values in case of unload */
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 
-/* Link to shared memory key */
+/* Link to shared memory and globals variables */
 static ShmemKMSMasterKeysLock *shmmasterkeyslock = NULL;
 static ShmemKMSKeyCache *shmkeycache = NULL;
-static HTAB	*shmmasterkeys = NULL;
+static HTAB *shmmasterkeys = NULL;
+static HTAB *utilityflags = NULL;
 
 extern Datum encrypt_text_in(PG_FUNCTION_ARGS);
 extern Datum encrypt_text_out(PG_FUNCTION_ARGS);
 extern Datum tcle_set_passphrase(PG_FUNCTION_ARGS);
 
 static bool RelationAMIsTcleam(Oid relid);
+static HeapTuple EncryptDecryptHeapTuple(HeapTuple tuple, TupleDesc tupleDesc,
+										 Oid tableId, int8 flag,
+										 unsigned char *table_key,
+										 Oid *type_oids);
+static void LoadTableKey(Oid databaseId, Oid tableId,
+						 unsigned char **table_keyPtr);
+static void get_encrypt_type_oids(Oid **oidsPtr);
+static void utility_flags_init(void);
+static void utility_flags_set(TransactionId xid, CommandId cid, int8 flag);
+static void utility_flags_remove(TransactionId xid, CommandId cid);
+static void utility_flags_mcb(void *arg);
+static bool ShouldEncryptDecryptTTS(void);
+static void SetNotEncryptDecryptTTS(void);
+static void ResetNotEncryptDecryptTTS(void);
 
 void _PG_init(void);
 void _PG_fini(void);
@@ -221,7 +262,6 @@ tcle_ProcessUtility(PlannedStmt *pstmt,
 {
 	Node		   *parsetree = pstmt->utilityStmt;
 	List		   *actions = NIL;
-
 
 	switch (nodeTag(parsetree))
 	{
@@ -688,54 +728,54 @@ tcle_set_passphrase(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Load encryptable types Oids into input array.
+ */
+static void
+get_encrypt_type_oids(Oid ** oidsPtr)
+{
+	Oid		namespaceId;
+
+	/*
+	 * FIXME: types Oid look up is done for "public" schema only, meaning that
+	 * if the extension is created within another schema, this lookup will
+	 * fail.
+	 */
+	namespaceId = get_namespace_oid("public", true);
+
+	for (int i = 0; i < N_ENCRYPT_TYPES; i++)
+	{
+		(*oidsPtr)[i] = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid,
+									  PointerGetDatum(encrypt_types[i]),
+									  ObjectIdGetDatum(namespaceId));
+	}
+}
+
+/*
  * Encrypt / decrypt tuple attributes from a TupleTableSlot.
  */
-static void EncryptDecryptTupleTableSlot(TupleTableSlot *slot, int8 flag)
+static void
+EncryptDecryptTupleTableSlot(TupleTableSlot *slot, int8 flag)
 {
 	/* Number of attributes (columns) */
 	int				natts;
-	/*
-	 * Number of attributes corresponding to a candidate type for encryption /
-	 * decryption
-	 */
-	int				natts_c_cryp = 0;
-	/*
-	 * Number of attributes that really have to be encrypted / decrypted,
-	 * excluding null values
-	 */
-	int				natts_r_cryp = 0;
-	/* encrypt_* type and namespace ids */
-	Oid				encrypt_text_oid, encrypt_numeric_oid,
-					encrypt_timestamptz_oid;
-
-	Oid				namespace_oid;
+	bool			found_encrypt_type = false;
 	/* Variables for tuple manipulation */
 	HeapTuple		tuple, new_tuple;
-	BufferHeapTupleTableSlot *hslot;
-
-	Datum		   *replvals;
-	bool		   *replnuls;
-	int			   *replcols;
-	int				pos = 0;
+	bool			shouldFreeTuple;
 	unsigned char  *table_key;
-	bytea		   *table_cipher_key;
+	Oid			   *type_oids;
+	BufferHeapTupleTableSlot *bslot;
+	MemoryContext	oldContext;
+
+	if (!ShouldEncryptDecryptTTS())
+		return;
+
+	/* Get encryptable data types Oids */
+	type_oids = (Oid *) palloc(N_ENCRYPT_TYPES * sizeof(Oid));
+	get_encrypt_type_oids(&type_oids);
 
 	natts = slot->tts_tupleDescriptor->natts;
 
-	/* Get type Oid by its name and namespace */
-	namespace_oid = get_namespace_oid("public", true);
-	encrypt_text_oid = GetSysCacheOid2(TYPENAMENSP,
-									   Anum_pg_type_oid,
-									   PointerGetDatum("encrypt_text"),
-									   ObjectIdGetDatum(namespace_oid));
-	encrypt_numeric_oid = GetSysCacheOid2(TYPENAMENSP,
-										  Anum_pg_type_oid,
-										  PointerGetDatum("encrypt_numeric"),
-										  ObjectIdGetDatum(namespace_oid));
-	encrypt_timestamptz_oid = GetSysCacheOid2(TYPENAMENSP,
-											  Anum_pg_type_oid,
-											  PointerGetDatum("encrypt_timestamptz"),
-											  ObjectIdGetDatum(namespace_oid));
 	/*
 	 * Quick attributes list lookup to see if any value should be encrypted /
 	 * decrypted later. We need to know maximum number of attributes we will
@@ -746,75 +786,125 @@ static void EncryptDecryptTupleTableSlot(TupleTableSlot *slot, int8 flag)
 	{
 		Form_pg_attribute att = TupleDescAttr(slot->tts_tupleDescriptor, i);
 
-		if (att->atttypid == encrypt_text_oid
-				|| att->atttypid == encrypt_numeric_oid
-				|| att->atttypid == encrypt_timestamptz_oid)
-			natts_c_cryp++;
+		if (IS_ENCRYPTABLE_TYPE(att->atttypid, type_oids))
+		{
+			found_encrypt_type = true;
+			break;
+		}
 	}
 
-	if (natts_c_cryp == 0)
+	if (!found_encrypt_type)
+	{
+		/* No encryptable data ? Just exit. */
+		pfree(type_oids);
 		return;
+	}
+
+	/* Load table's key */
+	table_key = (unsigned char *) palloc(AES_KEYLEN);
+	LoadTableKey(MyDatabaseId, slot->tts_tableOid, &table_key);
 
 	/* Fetch tuple from the slot */
-	hslot = (BufferHeapTupleTableSlot *) slot;
-	tuple = slot->tts_ops->get_heap_tuple(slot);
+	bslot = (BufferHeapTupleTableSlot *) slot;
+	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFreeTuple);
 
-	table_key = (unsigned char *) palloc(AES_KEYLEN);
+	/* Tuple encryption / decryption */
+	new_tuple = EncryptDecryptHeapTuple(tuple, slot->tts_tupleDescriptor,
+										slot->tts_tableOid, flag, table_key,
+										type_oids);
 
-	/*
-	 * Shared memory lookup for table's key. If not found then we have to load
-	 * the master key and fetch table's cipher key from KMS table and finally
-	 * push the table's key in shared memory.
-	 */
-	if (!CacheGetRelationKey(shmkeycache, MyDatabaseId, slot->tts_tableOid,
-							 &table_key))
-	{
-		unsigned char	*master_key;
-		master_key = (unsigned char *) palloc(AES_KEYLEN);
+	/* The Slot has been materialized, so we can free the buffer tuple */
+	heap_freetuple(bslot->base.tuple);
 
-		/* Get master key from shared memory */
-		if (!GetDatabaseMasterKey(shmmasterkeyslock, shmmasterkeys,
-								  MyDatabaseId, &master_key))
-			ereport(ERROR,
-					(errmsg("tcle: master key not found for this database")));
+	/* Tuple duplication into TTS memory context */
+	oldContext = MemoryContextSwitchTo(slot->tts_mcxt);
+	bslot->base.tuple = heap_copytuple(new_tuple);
+	MemoryContextSwitchTo(oldContext);
 
-		table_cipher_key = (bytea *) palloc(AES_IVLEN + AES_KEYLEN
-											+ AES_BLOCKLEN);
-		/* Load and decrypt table's key */
-		if (!GetKMSCipherKey(slot->tts_tableOid, &table_cipher_key))
-			ereport(ERROR, (errmsg("tcle: could not get table's key")));
+	/* Copy ctid and flag the TTS */
+	slot->tts_tid = new_tuple->t_self;
+	slot->tts_flags |= TTS_FLAG_SHOULDFREE;
 
-		if (!DecryptKMSCipherKey(table_cipher_key, master_key, &table_key))
-			ereport(ERROR,
-					(errmsg("tcle: could not decrypt table's cipher key")));
+	if (shouldFreeTuple)
+		heap_freetuple(tuple);
+	heap_freetuple(new_tuple);
+	pfree(table_key);
+	pfree(type_oids);
+}
 
-		pfree(table_cipher_key);
+/*
+ * Shared memory lookup for table's key. If not found then we have to load
+ * the master key and fetch table's cipher key from KMS table and finally
+ * push the table's key in shared memory.
+ */
+static void
+LoadTableKey(Oid databaseId, Oid tableId, unsigned char **table_keyPtr)
+{
+	unsigned char  *master_key;
+	bytea		   *table_cipher_key;
 
-		/* Add table's key in shared memory */
-		CacheAddRelationKey(shmkeycache, MyDatabaseId, slot->tts_tableOid,
-							table_key);
-	}
+	if (CacheGetRelationKey(shmkeycache, databaseId, tableId, table_keyPtr))
+		return;
 
-	/* Allocate memory for the attributes we'll have to encrypt / decrypt */
-	replvals = (Datum *) palloc(sizeof(Datum) *natts_c_cryp);
-	replnuls = (bool *) palloc(sizeof(bool) *natts_c_cryp);
-	replcols = (int *) palloc(sizeof(int) *natts_c_cryp);
+	master_key = (unsigned char *) palloc(AES_KEYLEN);
+
+	/* Get master key from shared memory */
+	if (!GetDatabaseMasterKey(shmmasterkeyslock, shmmasterkeys, databaseId,
+							  &master_key))
+		ereport(ERROR,
+				(errmsg("tcle: master key not found for this database")));
+
+	table_cipher_key = (bytea *) palloc(AES_IVLEN + AES_KEYLEN + AES_BLOCKLEN);
+
+	/* Load and decrypt table's key */
+	if (!GetKMSCipherKey(tableId, &table_cipher_key))
+		ereport(ERROR, (errmsg("tcle: could not get table's key")));
+
+	if (!DecryptKMSCipherKey(table_cipher_key, master_key, table_keyPtr))
+		ereport(ERROR, (errmsg("tcle: could not decrypt table's cipher key")));
+
+	pfree(table_cipher_key);
+	pfree(master_key);
+
+	/* Add table's key in shared memory */
+	CacheAddRelationKey(shmkeycache, databaseId, tableId, *table_keyPtr);
+}
+
+static HeapTuple
+EncryptDecryptHeapTuple(HeapTuple tuple, TupleDesc tupleDesc, Oid tableId,
+						int8 flag, unsigned char *table_key, Oid *type_oids)
+{
+	/* Variables for tuple manipulation */
+	HeapTuple		new_tuple;
+
+	Datum		   *values, *new_values;
+	bool		   *isnull;
+	MemoryContext	oldcontext, tmpcontext;
+
+	/* Let's do encryption / decryption in a dedicated memory context */
+	tmpcontext = AllocSetContextCreate(CurrentMemoryContext,
+									   "TCLE crypt tuple",
+									   ALLOCSET_DEFAULT_SIZES);
+	oldcontext = MemoryContextSwitchTo(tmpcontext);
+
+	values = (Datum *) palloc(sizeof(Datum) * tupleDesc->natts);
+	isnull = (bool *) palloc(sizeof(bool) * tupleDesc->natts);
+	new_values = (Datum *) palloc(sizeof(Datum) * tupleDesc->natts);
+
+	/* Extract tuple values and nulls */
+	heap_deform_tuple(tuple, tupleDesc, values, isnull);
 
 	/*
 	 * Loop through tuple descriptor attributes looking for ENCRYPT_* types
 	 * and apply encrypt/decrypt on attribute value if not null.
 	 */
-	for (int i=0; i < natts; i++)
+	for (int i=0; i < tupleDesc->natts; i++)
 	{
-		bool				isNull;
-		Datum				attVal;
-		/* Attribute value copy used for decryption */
-		Datum				attValCpy;
 		/*
 		 * plaintext / ciphertext length returned by AES decryption /
 		 * encryption functions.
 		 */
-		int					crypt_len;
+		int				crypt_len;
 		/*
 		 * Char buffer where encryption / decryption results will be stored.
 		 * To avoid further extra memory allocation, this buffer will be
@@ -841,36 +931,30 @@ static void EncryptDecryptTupleTableSlot(TupleTableSlot *slot, int8 flag)
 		 * ciphertext / plaintext size that AES encryption / decrytion function
 		 * returns.
 		 */
-		char			   *crypt_buffer;
+		char		   *crypt_buffer = NULL;
 		/* Input plaintext / ciphertext length */
-		int					buffer_len;
+		int				buffer_len;
 		/* AES initialization vector */
-		unsigned char		iv[AES_IVLEN];
+		unsigned char	iv[AES_IVLEN];
+		unsigned char  *att_buffer;
 		/* Tuple attribute description */
-		Form_pg_attribute	att = TupleDescAttr(slot->tts_tupleDescriptor,
-												 i);
-		unsigned char	   *att_buffer;
+		Form_pg_attribute att = TupleDescAttr(tupleDesc, i);
 
-		if (att->atttypid != encrypt_text_oid
-				&& att->atttypid != encrypt_numeric_oid
-				&& att->atttypid != encrypt_timestamptz_oid)
-			/* Not encrypt_text type */
+		if (!IS_ENCRYPTABLE_TYPE(att->atttypid, type_oids) || isnull[i])
+		{
+			/* Not encryptable type or null value*/
+			new_values[i] = values[i];
 			continue;
+		}
 
-		attVal = heap_getattr(tuple, i+1, slot->tts_tupleDescriptor,
-							  &isNull);
-
-		if (isNull)
-			/* No need to encrypt/decrypt null value */
-			continue;
+		att_buffer = (unsigned char *) VARDATA_ANY(values[i]);
+		buffer_len = (int) VARSIZE_ANY_EXHDR(values[i]);
 
 		if (flag == AES_ENCRYPT_FLAG)
 		{
 			/*
 			 * Encryption part
 			 */
-			att_buffer = (unsigned char *) VARDATA_ANY(attVal);
-			buffer_len = (int) VARSIZE_ANY_EXHDR(attVal);
 			crypt_buffer = (char *) palloc(buffer_len + AES_BLOCKLEN
 										   + AES_IVLEN + VARHDRSZ);
 
@@ -879,9 +963,9 @@ static void EncryptDecryptTupleTableSlot(TupleTableSlot *slot, int8 flag)
 			 * crypt_buffer
 			 */
 			if (!pg_strong_random(iv, AES_IVLEN))
-				ereport(ERROR,
-						(errmsg("tcle: could not generate random AES IV")));
+				goto error_rng;
 
+			/* Store AES IV */
 			memcpy(VARDATA(crypt_buffer), iv, AES_IVLEN);
 
 			/* AES encryption */
@@ -892,29 +976,20 @@ static void EncryptDecryptTupleTableSlot(TupleTableSlot *slot, int8 flag)
 										(unsigned char *) VARDATA(crypt_buffer)
 										+ AES_IVLEN);
 			if (crypt_len == -1)
-				ereport(ERROR,(errmsg("tcle: could not encrypt data")));
+				goto error_encrypt;
 
 			/* Set Datum size to the right size */
 			SET_VARSIZE(crypt_buffer, crypt_len + VARHDRSZ + AES_IVLEN);
-
 		}
 		else if (flag == AES_DECRYPT_FLAG)
 		{
 			/*
 			 * Decryption part
 			 */
-
-			/*
-			 * No need to detoast, we work only with plain storage
-			 */
-			attValCpy = datumCopy(attVal, att->attbyval, att->attlen);
-			att_buffer = (unsigned char *) VARDATA_ANY(attValCpy);
+			crypt_buffer = (char *) palloc(buffer_len + VARHDRSZ - AES_IVLEN);
 
 			/* Get AES IV */
 			memcpy(iv, att_buffer, AES_IVLEN);
-
-			buffer_len = (int) VARSIZE_ANY_EXHDR(attValCpy);
-			crypt_buffer = (char *) palloc(buffer_len + VARHDRSZ - AES_IVLEN);
 
 			/* AES decryption */
 			crypt_len = AES_CBC_decrypt(att_buffer + AES_IVLEN,
@@ -923,38 +998,212 @@ static void EncryptDecryptTupleTableSlot(TupleTableSlot *slot, int8 flag)
 										iv,
 										(unsigned char *) VARDATA(crypt_buffer));
 			if (crypt_len == -1)
-				ereport(ERROR,(errmsg("tcle: could not decrypt data")));
+				goto error_decrypt;
 
 			SET_VARSIZE(crypt_buffer, crypt_len + VARHDRSZ);
 		}
 
-		replvals[pos] = PointerGetDatum(crypt_buffer);
-		replnuls[pos] = isNull;
-		replcols[pos] = i + 1;
-
-		pos++;
-		natts_r_cryp++;
+		new_values[i] = PointerGetDatum(crypt_buffer);
 	}
 
-	/* Apply modifications on the tuple */
-	new_tuple = heap_modify_tuple_by_cols(tuple, slot->tts_tupleDescriptor,
-										  natts_r_cryp, replcols, replvals,
-										  replnuls);
+	MemoryContextSwitchTo(oldcontext);
+
+	/* Build a new tuple with updated (encrypted / decrypted) fields */
+	new_tuple = heap_form_tuple(tupleDesc, new_values, isnull);
 
 	/* Copy original tuple transaction informations */
 	memcpy(&new_tuple->t_data->t_choice.t_heap,
 		   &tuple->t_data->t_choice.t_heap,
 		   sizeof(HeapTupleFields));
+	memcpy(&new_tuple->t_data->t_choice.t_datum,
+		   &tuple->t_data->t_choice.t_datum,
+		   sizeof(DatumTupleFields));
+	new_tuple->t_data->t_infomask2 = tuple->t_data->t_infomask2;
+	new_tuple->t_data->t_infomask = tuple->t_data->t_infomask;
+	new_tuple->t_data->t_hoff = tuple->t_data->t_hoff;
+	new_tuple->t_data->t_ctid = tuple->t_data->t_ctid;
+	memcpy(new_tuple->t_data->t_bits,
+		   tuple->t_data->t_bits,
+		   BITMAPLEN(HeapTupleHeaderGetNatts(tuple->t_data)));
+	new_tuple->t_self = tuple->t_self;
+	new_tuple->t_tableOid = tuple->t_tableOid;
 
-	/* If TTS is a buffer slot, let's conserve original Buffer. */
-	if (BufferIsValid(hslot->buffer))
-		ExecStoreBufferHeapTuple(new_tuple, slot, hslot->buffer);
-	else
-		ExecForceStoreHeapTuple(new_tuple, slot, false);
+	MemoryContextDelete(tmpcontext);
 
-	pfree(replvals);
-	pfree(replnuls);
-	pfree(replcols);
+	return new_tuple;
+
+error_rng:
+	MemoryContextSwitchTo(oldcontext);
+	MemoryContextDelete(tmpcontext);
+	ereport(ERROR, (errmsg("tcle: could not generate random AES IV")));
+
+error_encrypt:
+	MemoryContextSwitchTo(oldcontext);
+	MemoryContextDelete(tmpcontext);
+	ereport(ERROR, (errmsg("tcle: could not encrypt data")));
+
+error_decrypt:
+	MemoryContextSwitchTo(oldcontext);
+	MemoryContextDelete(tmpcontext);
+	ereport(ERROR, (errmsg("tcle: could not decrypt data")));
+}
+
+/*
+ * Initializes utilityflags HTAB into TopTransaction memory context. The main
+ * goal here is to destroy and free the htab whatever is going on at the end of
+ * the transaction. Even if the htab is automatically freed when the memory
+ * context is destroyed, we still have to reset utilitflags to NULL if we want
+ * to reuse it and create a new htab for the next transaction (within the same
+ * backend). That's why we add a memory context reset callback in charge of
+ * reseting utilityflags to NULL.
+ */
+static void
+utility_flags_init(void)
+{
+	HASHCTL		ctl;
+	MemoryContextCallback *mcb;
+	MemoryContext oldContext;
+
+	MemSet(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(UtilityCryptFlagKey);
+	ctl.entrysize = sizeof(UtilityCryptFlagEntry);
+	ctl.hcxt = TopTransactionContext;
+
+	/*
+	 * Create the htab with only 1 element. This is not a shared-memory
+	 * htab, so it can be resized if needed.
+	 */
+	utilityflags = hash_create("utilityflags", 1, &ctl,
+							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	/* Callback struct must be allocated into target memory context */
+	oldContext = MemoryContextSwitchTo(TopTransactionContext);
+
+	mcb = (MemoryContextCallback *) palloc(sizeof(MemoryContextCallback));
+	mcb->func = utility_flags_mcb;
+	mcb->arg = NULL;
+
+	MemoryContextSwitchTo(oldContext);
+	MemoryContextRegisterResetCallback(TopTransactionContext, mcb);
+}
+
+/*
+ * Memory context reset callback to reset utilityflags.
+ */
+static void
+utility_flags_mcb(void *arg)
+{
+	if (utilityflags != NULL)
+		utilityflags = NULL;
+}
+
+/*
+ * Add a new entry into utilityflags htab. This routine initializes the htab if
+ * needed.
+ */
+static void
+utility_flags_set(TransactionId xid, CommandId cid, int8 flag)
+{
+	UtilityCryptFlagKey *hkey;
+	UtilityCryptFlagEntry *entry;
+
+	if (utilityflags == NULL)
+		utility_flags_init();
+
+	hkey = (UtilityCryptFlagKey *) palloc(sizeof(UtilityCryptFlagKey));
+	hkey->xid = xid;
+	hkey->cid = cid;
+
+	entry = (UtilityCryptFlagEntry *) hash_search(utilityflags, hkey,
+												  HASH_ENTER, NULL);
+	entry->flag = flag;
+
+	pfree(hkey);
+}
+
+/*
+ * Remove an entry from utilityflags htab.
+ */
+static void
+utility_flags_remove(TransactionId xid, CommandId cid)
+{
+	UtilityCryptFlagKey *hkey;
+
+	hkey = (UtilityCryptFlagKey *) palloc(sizeof(UtilityCryptFlagKey));
+	hkey->xid = xid;
+	hkey->cid = cid;
+
+	hash_search(utilityflags, hkey, HASH_REMOVE, NULL);
+
+	pfree(hkey);
+}
+
+/*
+ * Is current command inside current transaction been flagged with
+ * AES_NOCRYPT_FLAG ?
+ */
+static bool
+ShouldEncryptDecryptTTS(void)
+{
+	TransactionId	xid;
+	CommandId		cid;
+	bool			found;
+	bool			shouldCrypt = true;
+	UtilityCryptFlagKey *hkey;
+	UtilityCryptFlagEntry *entry;
+
+	xid = GetCurrentTransactionIdIfAny();
+	cid = GetCurrentCommandId(false);
+
+	if (xid == InvalidTransactionId)
+		return true;
+
+	if (utilityflags == NULL)
+		return true;
+
+	hkey = (UtilityCryptFlagKey *) palloc(sizeof(UtilityCryptFlagKey));
+	hkey->xid = xid;
+	hkey->cid = cid;
+
+	entry = (UtilityCryptFlagEntry *) hash_search(utilityflags, hkey,
+												  HASH_FIND, &found);
+
+	if (found && entry->flag == AES_NOCRYPT_FLAG)
+		shouldCrypt = false;
+
+	pfree(hkey);
+
+	return shouldCrypt;
+}
+
+/*
+ * Flags current command inside current transaction with AES_NOCRYPT_FLAG.
+ */
+static void
+SetNotEncryptDecryptTTS(void)
+{
+	TransactionId	xid;
+	CommandId		cid;
+
+	xid = GetCurrentTransactionIdIfAny();
+	cid = GetCurrentCommandId(false);
+
+	utility_flags_set(xid, cid, AES_NOCRYPT_FLAG);
+}
+
+/*
+ * Remove flag if any.
+ */
+static void
+ResetNotEncryptDecryptTTS(void)
+{
+	TransactionId	xid;
+	CommandId		cid;
+
+	xid = GetCurrentTransactionIdIfAny();
+	cid = GetCurrentCommandId(false);
+
+	utility_flags_remove(xid, cid);
 }
 
 /* ------------------------------------------------------------------------
@@ -1217,17 +1466,6 @@ tcleam_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 }
 
 
-/*
- * Duplicated from src/backend/access/heap/heapam_handler.c
- */
-/*
- * This version has been tweaked to apply AES encryption before rewriting
- * tuples. In theory, we shouldn't have to decrypt / encrypt when rewriting
- * tuples in VACUUM FULL or CLUSTER context, we could just rewrite them "as
- * it", but heapam_relation_copy_for_cluster() relies on index_getnext_slot()
- * and table_scan_getnextslot() to fetch tuples and those 2 functions decrypt
- * tuples.
- */
 static void
 tcleam_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 								 Relation OldIndex, bool use_sort,
@@ -1238,283 +1476,20 @@ tcleam_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 								 double *tups_vacuumed,
 								 double *tups_recently_dead)
 {
-	RewriteState rwstate;
-	IndexScanDesc indexScan;
-	TableScanDesc tableScan;
-	HeapScanDesc heapScan;
-	bool		is_system_catalog;
-	Tuplesortstate *tuplesort;
-	TupleDesc	oldTupDesc = RelationGetDescr(OldHeap);
-	TupleDesc	newTupDesc = RelationGetDescr(NewHeap);
-	TupleTableSlot *slot;
-	int			natts;
-	Datum	   *values;
-	bool	   *isnull;
-	BufferHeapTupleTableSlot *hslot;
+	/* Flags current command to not encrypt / decrypt tuples */
+	SetNotEncryptDecryptTTS();
 
-	/* Remember if it's a system catalog */
-	is_system_catalog = IsSystemRelation(OldHeap);
+	GetHeapamTableAmRoutine()->relation_copy_for_cluster(OldHeap, NewHeap,
+														 OldIndex, use_sort,
+														 OldestXmin,
+														 xid_cutoff,
+														 multi_cutoff,
+														 num_tuples,
+														 tups_vacuumed,
+														 tups_recently_dead);
 
-	/*
-	 * Valid smgr_targblock implies something already wrote to the relation.
-	 * This may be harmless, but this function hasn't planned for it.
-	 */
-	Assert(RelationGetTargetBlock(NewHeap) == InvalidBlockNumber);
-
-	/* Preallocate values/isnull arrays */
-	natts = newTupDesc->natts;
-	values = (Datum *) palloc(natts * sizeof(Datum));
-	isnull = (bool *) palloc(natts * sizeof(bool));
-
-	/* Initialize the rewrite operation */
-	rwstate = begin_heap_rewrite(OldHeap, NewHeap, OldestXmin, *xid_cutoff,
-								 *multi_cutoff);
-
-
-	/* Set up sorting if wanted */
-	if (use_sort)
-		tuplesort = tuplesort_begin_cluster(oldTupDesc, OldIndex,
-											maintenance_work_mem,
-											NULL, false);
-	else
-		tuplesort = NULL;
-
-	/*
-	 * Prepare to scan the OldHeap.  To ensure we see recently-dead tuples
-	 * that still need to be copied, we scan with SnapshotAny and use
-	 * HeapTupleSatisfiesVacuum for the visibility test.
-	 */
-	if (OldIndex != NULL && !use_sort)
-	{
-		const int	ci_index[] = {
-			PROGRESS_CLUSTER_PHASE,
-			PROGRESS_CLUSTER_INDEX_RELID
-		};
-		int64		ci_val[2];
-
-		/* Set phase and OIDOldIndex to columns */
-		ci_val[0] = PROGRESS_CLUSTER_PHASE_INDEX_SCAN_HEAP;
-		ci_val[1] = RelationGetRelid(OldIndex);
-		pgstat_progress_update_multi_param(2, ci_index, ci_val);
-
-		tableScan = NULL;
-		heapScan = NULL;
-		indexScan = index_beginscan(OldHeap, OldIndex, SnapshotAny, 0, 0);
-		index_rescan(indexScan, NULL, 0, NULL, 0);
-	}
-	else
-	{
-		/* In scan-and-sort mode and also VACUUM FULL, set phase */
-		pgstat_progress_update_param(PROGRESS_CLUSTER_PHASE,
-									 PROGRESS_CLUSTER_PHASE_SEQ_SCAN_HEAP);
-
-		tableScan = table_beginscan(OldHeap, SnapshotAny, 0, (ScanKey) NULL);
-		heapScan = (HeapScanDesc) tableScan;
-		indexScan = NULL;
-
-		/* Set total heap blocks */
-		pgstat_progress_update_param(PROGRESS_CLUSTER_TOTAL_HEAP_BLKS,
-									 heapScan->rs_nblocks);
-	}
-
-	slot = table_slot_create(OldHeap, NULL);
-	hslot = (BufferHeapTupleTableSlot *) slot;
-
-	/*
-	 * Scan through the OldHeap, either in OldIndex order or sequentially;
-	 * copy each tuple into the NewHeap, or transiently to the tuplesort
-	 * module.  Note that we don't bother sorting dead tuples (they won't get
-	 * to the new table anyway).
-	 */
-	for (;;)
-	{
-		HeapTuple	tuple;
-		Buffer		buf;
-		bool		isdead;
-
-		CHECK_FOR_INTERRUPTS();
-
-		if (indexScan != NULL)
-		{
-			if (!index_getnext_slot(indexScan, ForwardScanDirection, slot))
-				break;
-
-			/* Since we used no scan keys, should never need to recheck */
-			if (indexScan->xs_recheck)
-				elog(ERROR, "CLUSTER does not support lossy index conditions");
-		}
-		else
-		{
-			if (!table_scan_getnextslot(tableScan, ForwardScanDirection, slot))
-				break;
-
-			/*
-			 * In scan-and-sort mode and also VACUUM FULL, set heap blocks
-			 * scanned
-			 */
-			pgstat_progress_update_param(PROGRESS_CLUSTER_HEAP_BLKS_SCANNED,
-										 heapScan->rs_cblock + 1);
-		}
-
-		/* Apply AES encryption on tuple attributes */
-		EncryptDecryptTupleTableSlot(slot, AES_ENCRYPT_FLAG);
-
-		tuple = ExecFetchSlotHeapTuple(slot, false, NULL);
-		buf = hslot->buffer;
-
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-
-		switch (HeapTupleSatisfiesVacuum(tuple, OldestXmin, buf))
-		{
-			case HEAPTUPLE_DEAD:
-				/* Definitely dead */
-				isdead = true;
-				break;
-			case HEAPTUPLE_RECENTLY_DEAD:
-				*tups_recently_dead += 1;
-				/* fall through */
-			case HEAPTUPLE_LIVE:
-				/* Live or recently dead, must copy it */
-				isdead = false;
-				break;
-			case HEAPTUPLE_INSERT_IN_PROGRESS:
-
-				/*
-				 * Since we hold exclusive lock on the relation, normally the
-				 * only way to see this is if it was inserted earlier in our
-				 * own transaction.  However, it can happen in system
-				 * catalogs, since we tend to release write lock before commit
-				 * there.  Give a warning if neither case applies; but in any
-				 * case we had better copy it.
-				 */
-				if (!is_system_catalog &&
-					!TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetXmin(tuple->t_data)))
-					elog(WARNING, "concurrent insert in progress within table \"%s\"",
-						 RelationGetRelationName(OldHeap));
-				/* treat as live */
-				isdead = false;
-				break;
-			case HEAPTUPLE_DELETE_IN_PROGRESS:
-
-				/*
-				 * Similar situation to INSERT_IN_PROGRESS case.
-				 */
-				if (!is_system_catalog &&
-					!TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetUpdateXid(tuple->t_data)))
-					elog(WARNING, "concurrent delete in progress within table \"%s\"",
-						 RelationGetRelationName(OldHeap));
-				/* treat as recently dead */
-				*tups_recently_dead += 1;
-				isdead = false;
-				break;
-			default:
-				elog(ERROR, "unexpected HeapTupleSatisfiesVacuum result");
-				isdead = false; /* keep compiler quiet */
-				break;
-		}
-
-		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-
-		if (isdead)
-		{
-			*tups_vacuumed += 1;
-			/* heap rewrite module still needs to see it... */
-			if (rewrite_heap_dead_tuple(rwstate, tuple))
-			{
-				/* A previous recently-dead tuple is now known dead */
-				*tups_vacuumed += 1;
-				*tups_recently_dead -= 1;
-			}
-			continue;
-		}
-
-		*num_tuples += 1;
-		if (tuplesort != NULL)
-		{
-			tuplesort_putheaptuple(tuplesort, tuple);
-
-			/*
-			 * In scan-and-sort mode, report increase in number of tuples
-			 * scanned
-			 */
-			pgstat_progress_update_param(PROGRESS_CLUSTER_HEAP_TUPLES_SCANNED,
-										 *num_tuples);
-		}
-		else
-		{
-			const int	ct_index[] = {
-				PROGRESS_CLUSTER_HEAP_TUPLES_SCANNED,
-				PROGRESS_CLUSTER_HEAP_TUPLES_WRITTEN
-			};
-			int64		ct_val[2];
-
-			reform_and_rewrite_tuple(tuple, OldHeap, NewHeap,
-									 values, isnull, rwstate);
-
-			/*
-			 * In indexscan mode and also VACUUM FULL, report increase in
-			 * number of tuples scanned and written
-			 */
-			ct_val[0] = *num_tuples;
-			ct_val[1] = *num_tuples;
-			pgstat_progress_update_multi_param(2, ct_index, ct_val);
-		}
-	}
-
-	if (indexScan != NULL)
-		index_endscan(indexScan);
-	if (tableScan != NULL)
-		table_endscan(tableScan);
-	if (slot)
-		ExecDropSingleTupleTableSlot(slot);
-
-	/*
-	 * In scan-and-sort mode, complete the sort, then read out all live tuples
-	 * from the tuplestore and write them to the new relation.
-	 */
-	if (tuplesort != NULL)
-	{
-		double		n_tuples = 0;
-
-		/* Report that we are now sorting tuples */
-		pgstat_progress_update_param(PROGRESS_CLUSTER_PHASE,
-									 PROGRESS_CLUSTER_PHASE_SORT_TUPLES);
-
-		tuplesort_performsort(tuplesort);
-
-		/* Report that we are now writing new heap */
-		pgstat_progress_update_param(PROGRESS_CLUSTER_PHASE,
-									 PROGRESS_CLUSTER_PHASE_WRITE_NEW_HEAP);
-
-		for (;;)
-		{
-			HeapTuple	tuple;
-
-			CHECK_FOR_INTERRUPTS();
-
-			tuple = tuplesort_getheaptuple(tuplesort, true);
-			if (tuple == NULL)
-				break;
-
-			n_tuples += 1;
-			reform_and_rewrite_tuple(tuple,
-									 OldHeap, NewHeap,
-									 values, isnull,
-									 rwstate);
-			/* Report n_tuples */
-			pgstat_progress_update_param(PROGRESS_CLUSTER_HEAP_TUPLES_WRITTEN,
-										 n_tuples);
-		}
-
-		tuplesort_end(tuplesort);
-	}
-
-	/* Write out any remaining tuples, and fsync if needed */
-	end_heap_rewrite(rwstate);
-
-	/* Clean up */
-	pfree(values);
-	pfree(isnull);
+	/* Burn the flag */
+	ResetNotEncryptDecryptTTS();
 }
 
 static bool
