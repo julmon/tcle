@@ -7,6 +7,7 @@
 
 #define AES_ENCRYPT_FLAG	0
 #define AES_DECRYPT_FLAG	1
+#define AES_NOCRYPT_FLAG	2
 
 
 int AES_CBC_encrypt(unsigned char *plaintext, int plaintext_len,

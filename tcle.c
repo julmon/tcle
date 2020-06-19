@@ -63,6 +63,21 @@ PG_MODULE_MAGIC;
 #define IS_ENCRYPTABLE_TYPE(OID, ARRAY) \
 	(OID == ARRAY[0] || OID == ARRAY[1] || OID == ARRAY[2])
 
+/*
+ * UtilityCryptFlag* struct are used to store in a htab (local to backend) a
+ * flag related to current command. This flag will allow to disable encryption
+ * / decryption for some utility statements like VACUUM FULL or CLUSTER.
+ */
+typedef struct UtilityCryptFlagKey {
+	TransactionId	xid; /* Current Transaction ID */
+	CommandId		cid; /* Command ID */
+} UtilityCryptFlagKey;
+
+typedef struct UtilityCryptFlagEntry {
+	UtilityCryptFlagKey key;
+	int8			flag;
+} UtilityCryptFlagEntry;
+
 /* Array of encryptable data type names currently implemented */
 static const char *encrypt_types[N_ENCRYPT_TYPES] = {"encrypt_text",
 													 "encrypt_numeric",
@@ -72,10 +87,11 @@ static const char *encrypt_types[N_ENCRYPT_TYPES] = {"encrypt_text",
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 
-/* Link to shared memory key */
+/* Link to shared memory and globals variables */
 static ShmemKMSMasterKeysLock *shmmasterkeyslock = NULL;
 static ShmemKMSKeyCache *shmkeycache = NULL;
-static HTAB	*shmmasterkeys = NULL;
+static HTAB *shmmasterkeys = NULL;
+static HTAB *utilityflags = NULL;
 
 extern Datum encrypt_text_in(PG_FUNCTION_ARGS);
 extern Datum encrypt_text_out(PG_FUNCTION_ARGS);
@@ -89,6 +105,13 @@ static HeapTuple EncryptDecryptHeapTuple(HeapTuple tuple, TupleDesc tupleDesc,
 static void LoadTableKey(Oid databaseId, Oid tableId,
 						 unsigned char **table_keyPtr);
 static void get_encrypt_type_oids(Oid **oidsPtr);
+static void utility_flags_init(void);
+static void utility_flags_set(TransactionId xid, CommandId cid, int8 flag);
+static void utility_flags_remove(TransactionId xid, CommandId cid);
+static void utility_flags_mcb(void *arg);
+static bool ShouldEncryptDecryptTTS(void);
+static void SetNotEncryptDecryptTTS(void);
+static void ResetNotEncryptDecryptTTS(void);
 
 void _PG_init(void);
 void _PG_fini(void);
@@ -744,6 +767,9 @@ EncryptDecryptTupleTableSlot(TupleTableSlot *slot, int8 flag)
 	BufferHeapTupleTableSlot *bslot;
 	MemoryContext	oldContext;
 
+	if (!ShouldEncryptDecryptTTS())
+		return;
+
 	/* Get encryptable data types Oids */
 	type_oids = (Oid *) palloc(N_ENCRYPT_TYPES * sizeof(Oid));
 	get_encrypt_type_oids(&type_oids);
@@ -1022,6 +1048,164 @@ error_decrypt:
 	ereport(ERROR, (errmsg("tcle: could not decrypt data")));
 }
 
+/*
+ * Initializes utilityflags HTAB into TopTransaction memory context. The main
+ * goal here is to destroy and free the htab whatever is going on at the end of
+ * the transaction. Even if the htab is automatically freed when the memory
+ * context is destroyed, we still have to reset utilitflags to NULL if we want
+ * to reuse it and create a new htab for the next transaction (within the same
+ * backend). That's why we add a memory context reset callback in charge of
+ * reseting utilityflags to NULL.
+ */
+static void
+utility_flags_init(void)
+{
+	HASHCTL		ctl;
+	MemoryContextCallback *mcb;
+	MemoryContext oldContext;
+
+	MemSet(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(UtilityCryptFlagKey);
+	ctl.entrysize = sizeof(UtilityCryptFlagEntry);
+	ctl.hcxt = TopTransactionContext;
+
+	/*
+	 * Create the htab with only 1 element. This is not a shared-memory
+	 * htab, so it can be resized if needed.
+	 */
+	utilityflags = hash_create("utilityflags", 1, &ctl,
+							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	/* Callback struct must be allocated into target memory context */
+	oldContext = MemoryContextSwitchTo(TopTransactionContext);
+
+	mcb = (MemoryContextCallback *) palloc(sizeof(MemoryContextCallback));
+	mcb->func = utility_flags_mcb;
+	mcb->arg = NULL;
+
+	MemoryContextSwitchTo(oldContext);
+	MemoryContextRegisterResetCallback(TopTransactionContext, mcb);
+}
+
+/*
+ * Memory context reset callback to reset utilityflags.
+ */
+static void
+utility_flags_mcb(void *arg)
+{
+	if (utilityflags != NULL)
+		utilityflags = NULL;
+}
+
+/*
+ * Add a new entry into utilityflags htab. This routine initializes the htab if
+ * needed.
+ */
+static void
+utility_flags_set(TransactionId xid, CommandId cid, int8 flag)
+{
+	UtilityCryptFlagKey *hkey;
+	UtilityCryptFlagEntry *entry;
+
+	if (utilityflags == NULL)
+		utility_flags_init();
+
+	hkey = (UtilityCryptFlagKey *) palloc(sizeof(UtilityCryptFlagKey));
+	hkey->xid = xid;
+	hkey->cid = cid;
+
+	entry = (UtilityCryptFlagEntry *) hash_search(utilityflags, hkey,
+												  HASH_ENTER, NULL);
+	entry->flag = flag;
+
+	pfree(hkey);
+}
+
+/*
+ * Remove an entry from utilityflags htab.
+ */
+static void
+utility_flags_remove(TransactionId xid, CommandId cid)
+{
+	UtilityCryptFlagKey *hkey;
+
+	hkey = (UtilityCryptFlagKey *) palloc(sizeof(UtilityCryptFlagKey));
+	hkey->xid = xid;
+	hkey->cid = cid;
+
+	hash_search(utilityflags, hkey, HASH_REMOVE, NULL);
+
+	pfree(hkey);
+}
+
+/*
+ * Is current command inside current transaction been flagged with
+ * AES_NOCRYPT_FLAG ?
+ */
+static bool
+ShouldEncryptDecryptTTS(void)
+{
+	TransactionId	xid;
+	CommandId		cid;
+	bool			found;
+	bool			shouldCrypt = true;
+	UtilityCryptFlagKey *hkey;
+	UtilityCryptFlagEntry *entry;
+
+	xid = GetCurrentTransactionIdIfAny();
+	cid = GetCurrentCommandId(false);
+
+	if (xid == InvalidTransactionId)
+		return true;
+
+	if (utilityflags == NULL)
+		return true;
+
+	hkey = (UtilityCryptFlagKey *) palloc(sizeof(UtilityCryptFlagKey));
+	hkey->xid = xid;
+	hkey->cid = cid;
+
+	entry = (UtilityCryptFlagEntry *) hash_search(utilityflags, hkey,
+												  HASH_FIND, &found);
+
+	if (found && entry->flag == AES_NOCRYPT_FLAG)
+		shouldCrypt = false;
+
+	pfree(hkey);
+
+	return shouldCrypt;
+}
+
+/*
+ * Flags current command inside current transaction with AES_NOCRYPT_FLAG.
+ */
+static void
+SetNotEncryptDecryptTTS(void)
+{
+	TransactionId	xid;
+	CommandId		cid;
+
+	xid = GetCurrentTransactionIdIfAny();
+	cid = GetCurrentCommandId(false);
+
+	utility_flags_set(xid, cid, AES_NOCRYPT_FLAG);
+}
+
+/*
+ * Remove flag if any.
+ */
+static void
+ResetNotEncryptDecryptTTS(void)
+{
+	TransactionId	xid;
+	CommandId		cid;
+
+	xid = GetCurrentTransactionIdIfAny();
+	cid = GetCurrentCommandId(false);
+
+	utility_flags_remove(xid, cid);
+}
+
 /* ------------------------------------------------------------------------
  * Slot related callbacks
  * ------------------------------------------------------------------------
@@ -1282,17 +1466,6 @@ tcleam_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 }
 
 
-/*
- * Duplicated from src/backend/access/heap/heapam_handler.c
- */
-/*
- * This version has been tweaked to apply AES encryption before rewriting
- * tuples. In theory, we shouldn't have to decrypt / encrypt when rewriting
- * tuples in VACUUM FULL or CLUSTER context, we could just rewrite them "as
- * it", but heapam_relation_copy_for_cluster() relies on index_getnext_slot()
- * and table_scan_getnextslot() to fetch tuples and those 2 functions decrypt
- * tuples.
- */
 static void
 tcleam_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 								 Relation OldIndex, bool use_sort,
@@ -1303,283 +1476,20 @@ tcleam_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 								 double *tups_vacuumed,
 								 double *tups_recently_dead)
 {
-	RewriteState rwstate;
-	IndexScanDesc indexScan;
-	TableScanDesc tableScan;
-	HeapScanDesc heapScan;
-	bool		is_system_catalog;
-	Tuplesortstate *tuplesort;
-	TupleDesc	oldTupDesc = RelationGetDescr(OldHeap);
-	TupleDesc	newTupDesc = RelationGetDescr(NewHeap);
-	TupleTableSlot *slot;
-	int			natts;
-	Datum	   *values;
-	bool	   *isnull;
-	BufferHeapTupleTableSlot *hslot;
+	/* Flags current command to not encrypt / decrypt tuples */
+	SetNotEncryptDecryptTTS();
 
-	/* Remember if it's a system catalog */
-	is_system_catalog = IsSystemRelation(OldHeap);
+	GetHeapamTableAmRoutine()->relation_copy_for_cluster(OldHeap, NewHeap,
+														 OldIndex, use_sort,
+														 OldestXmin,
+														 xid_cutoff,
+														 multi_cutoff,
+														 num_tuples,
+														 tups_vacuumed,
+														 tups_recently_dead);
 
-	/*
-	 * Valid smgr_targblock implies something already wrote to the relation.
-	 * This may be harmless, but this function hasn't planned for it.
-	 */
-	Assert(RelationGetTargetBlock(NewHeap) == InvalidBlockNumber);
-
-	/* Preallocate values/isnull arrays */
-	natts = newTupDesc->natts;
-	values = (Datum *) palloc(natts * sizeof(Datum));
-	isnull = (bool *) palloc(natts * sizeof(bool));
-
-	/* Initialize the rewrite operation */
-	rwstate = begin_heap_rewrite(OldHeap, NewHeap, OldestXmin, *xid_cutoff,
-								 *multi_cutoff);
-
-
-	/* Set up sorting if wanted */
-	if (use_sort)
-		tuplesort = tuplesort_begin_cluster(oldTupDesc, OldIndex,
-											maintenance_work_mem,
-											NULL, false);
-	else
-		tuplesort = NULL;
-
-	/*
-	 * Prepare to scan the OldHeap.  To ensure we see recently-dead tuples
-	 * that still need to be copied, we scan with SnapshotAny and use
-	 * HeapTupleSatisfiesVacuum for the visibility test.
-	 */
-	if (OldIndex != NULL && !use_sort)
-	{
-		const int	ci_index[] = {
-			PROGRESS_CLUSTER_PHASE,
-			PROGRESS_CLUSTER_INDEX_RELID
-		};
-		int64		ci_val[2];
-
-		/* Set phase and OIDOldIndex to columns */
-		ci_val[0] = PROGRESS_CLUSTER_PHASE_INDEX_SCAN_HEAP;
-		ci_val[1] = RelationGetRelid(OldIndex);
-		pgstat_progress_update_multi_param(2, ci_index, ci_val);
-
-		tableScan = NULL;
-		heapScan = NULL;
-		indexScan = index_beginscan(OldHeap, OldIndex, SnapshotAny, 0, 0);
-		index_rescan(indexScan, NULL, 0, NULL, 0);
-	}
-	else
-	{
-		/* In scan-and-sort mode and also VACUUM FULL, set phase */
-		pgstat_progress_update_param(PROGRESS_CLUSTER_PHASE,
-									 PROGRESS_CLUSTER_PHASE_SEQ_SCAN_HEAP);
-
-		tableScan = table_beginscan(OldHeap, SnapshotAny, 0, (ScanKey) NULL);
-		heapScan = (HeapScanDesc) tableScan;
-		indexScan = NULL;
-
-		/* Set total heap blocks */
-		pgstat_progress_update_param(PROGRESS_CLUSTER_TOTAL_HEAP_BLKS,
-									 heapScan->rs_nblocks);
-	}
-
-	slot = table_slot_create(OldHeap, NULL);
-	hslot = (BufferHeapTupleTableSlot *) slot;
-
-	/*
-	 * Scan through the OldHeap, either in OldIndex order or sequentially;
-	 * copy each tuple into the NewHeap, or transiently to the tuplesort
-	 * module.  Note that we don't bother sorting dead tuples (they won't get
-	 * to the new table anyway).
-	 */
-	for (;;)
-	{
-		HeapTuple	tuple;
-		Buffer		buf;
-		bool		isdead;
-
-		CHECK_FOR_INTERRUPTS();
-
-		if (indexScan != NULL)
-		{
-			if (!index_getnext_slot(indexScan, ForwardScanDirection, slot))
-				break;
-
-			/* Since we used no scan keys, should never need to recheck */
-			if (indexScan->xs_recheck)
-				elog(ERROR, "CLUSTER does not support lossy index conditions");
-		}
-		else
-		{
-			if (!table_scan_getnextslot(tableScan, ForwardScanDirection, slot))
-				break;
-
-			/*
-			 * In scan-and-sort mode and also VACUUM FULL, set heap blocks
-			 * scanned
-			 */
-			pgstat_progress_update_param(PROGRESS_CLUSTER_HEAP_BLKS_SCANNED,
-										 heapScan->rs_cblock + 1);
-		}
-
-		/* Apply AES encryption on tuple attributes */
-		EncryptDecryptTupleTableSlot(slot, AES_ENCRYPT_FLAG);
-
-		tuple = ExecFetchSlotHeapTuple(slot, false, NULL);
-		buf = hslot->buffer;
-
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-
-		switch (HeapTupleSatisfiesVacuum(tuple, OldestXmin, buf))
-		{
-			case HEAPTUPLE_DEAD:
-				/* Definitely dead */
-				isdead = true;
-				break;
-			case HEAPTUPLE_RECENTLY_DEAD:
-				*tups_recently_dead += 1;
-				/* fall through */
-			case HEAPTUPLE_LIVE:
-				/* Live or recently dead, must copy it */
-				isdead = false;
-				break;
-			case HEAPTUPLE_INSERT_IN_PROGRESS:
-
-				/*
-				 * Since we hold exclusive lock on the relation, normally the
-				 * only way to see this is if it was inserted earlier in our
-				 * own transaction.  However, it can happen in system
-				 * catalogs, since we tend to release write lock before commit
-				 * there.  Give a warning if neither case applies; but in any
-				 * case we had better copy it.
-				 */
-				if (!is_system_catalog &&
-					!TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetXmin(tuple->t_data)))
-					elog(WARNING, "concurrent insert in progress within table \"%s\"",
-						 RelationGetRelationName(OldHeap));
-				/* treat as live */
-				isdead = false;
-				break;
-			case HEAPTUPLE_DELETE_IN_PROGRESS:
-
-				/*
-				 * Similar situation to INSERT_IN_PROGRESS case.
-				 */
-				if (!is_system_catalog &&
-					!TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetUpdateXid(tuple->t_data)))
-					elog(WARNING, "concurrent delete in progress within table \"%s\"",
-						 RelationGetRelationName(OldHeap));
-				/* treat as recently dead */
-				*tups_recently_dead += 1;
-				isdead = false;
-				break;
-			default:
-				elog(ERROR, "unexpected HeapTupleSatisfiesVacuum result");
-				isdead = false; /* keep compiler quiet */
-				break;
-		}
-
-		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-
-		if (isdead)
-		{
-			*tups_vacuumed += 1;
-			/* heap rewrite module still needs to see it... */
-			if (rewrite_heap_dead_tuple(rwstate, tuple))
-			{
-				/* A previous recently-dead tuple is now known dead */
-				*tups_vacuumed += 1;
-				*tups_recently_dead -= 1;
-			}
-			continue;
-		}
-
-		*num_tuples += 1;
-		if (tuplesort != NULL)
-		{
-			tuplesort_putheaptuple(tuplesort, tuple);
-
-			/*
-			 * In scan-and-sort mode, report increase in number of tuples
-			 * scanned
-			 */
-			pgstat_progress_update_param(PROGRESS_CLUSTER_HEAP_TUPLES_SCANNED,
-										 *num_tuples);
-		}
-		else
-		{
-			const int	ct_index[] = {
-				PROGRESS_CLUSTER_HEAP_TUPLES_SCANNED,
-				PROGRESS_CLUSTER_HEAP_TUPLES_WRITTEN
-			};
-			int64		ct_val[2];
-
-			reform_and_rewrite_tuple(tuple, OldHeap, NewHeap,
-									 values, isnull, rwstate);
-
-			/*
-			 * In indexscan mode and also VACUUM FULL, report increase in
-			 * number of tuples scanned and written
-			 */
-			ct_val[0] = *num_tuples;
-			ct_val[1] = *num_tuples;
-			pgstat_progress_update_multi_param(2, ct_index, ct_val);
-		}
-	}
-
-	if (indexScan != NULL)
-		index_endscan(indexScan);
-	if (tableScan != NULL)
-		table_endscan(tableScan);
-	if (slot)
-		ExecDropSingleTupleTableSlot(slot);
-
-	/*
-	 * In scan-and-sort mode, complete the sort, then read out all live tuples
-	 * from the tuplestore and write them to the new relation.
-	 */
-	if (tuplesort != NULL)
-	{
-		double		n_tuples = 0;
-
-		/* Report that we are now sorting tuples */
-		pgstat_progress_update_param(PROGRESS_CLUSTER_PHASE,
-									 PROGRESS_CLUSTER_PHASE_SORT_TUPLES);
-
-		tuplesort_performsort(tuplesort);
-
-		/* Report that we are now writing new heap */
-		pgstat_progress_update_param(PROGRESS_CLUSTER_PHASE,
-									 PROGRESS_CLUSTER_PHASE_WRITE_NEW_HEAP);
-
-		for (;;)
-		{
-			HeapTuple	tuple;
-
-			CHECK_FOR_INTERRUPTS();
-
-			tuple = tuplesort_getheaptuple(tuplesort, true);
-			if (tuple == NULL)
-				break;
-
-			n_tuples += 1;
-			reform_and_rewrite_tuple(tuple,
-									 OldHeap, NewHeap,
-									 values, isnull,
-									 rwstate);
-			/* Report n_tuples */
-			pgstat_progress_update_param(PROGRESS_CLUSTER_HEAP_TUPLES_WRITTEN,
-										 n_tuples);
-		}
-
-		tuplesort_end(tuplesort);
-	}
-
-	/* Write out any remaining tuples, and fsync if needed */
-	end_heap_rewrite(rwstate);
-
-	/* Clean up */
-	pfree(values);
-	pfree(isnull);
+	/* Burn the flag */
+	ResetNotEncryptDecryptTTS();
 }
 
 static bool
