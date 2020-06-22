@@ -40,6 +40,7 @@
 #include "commands/dbcommands.h"
 #include "commands/progress.h"
 #include "libpq/pqformat.h"
+#include "miscadmin.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
 #include "storage/bufmgr.h"
@@ -144,6 +145,13 @@ PG_FUNCTION_INFO_V1(tcle_set_passphrase);
 void
 _PG_init(void)
 {
+	/*
+	 * Ensures TCLE library has been loaded via shared_preload_libraries.
+	 */
+	if (!process_shared_preload_libraries_in_progress)
+		ereport(ERROR,
+				(errmsg("tcle must be loaded via shared_preload_libraries")));
+
 	RequestNamedLWLockTranche("tcle", 2);
 
 	/* Install hooks. */
