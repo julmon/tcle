@@ -17,9 +17,5 @@ extern double tcleam_index_build_range_scan(Relation heapRelation,
 											IndexBuildCallback callback,
 											void *callback_state,
 											TableScanDesc scan);
-extern void
-reform_and_rewrite_tuple(HeapTuple tuple,
-						 Relation OldHeap, Relation NewHeap,
-						 Datum *values, bool *isnull, RewriteState rwstate);
 
 #endif
