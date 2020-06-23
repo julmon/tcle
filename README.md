@@ -59,6 +59,28 @@ $ sudo PG_CONFIG=/path/to/pg_config make clean install
 Once the extension is installed, TCLE library must be loaded by adding `tcle`
 into `shared_preload_libraries` parameter and restart PostgreSQL cluster.
 
+## Regression tests
+
+Once the extension compiled and installed, PostgreSQL server configured,
+regression tests can be run with `make installcheck` like this:
+```console
+$ PG_CONFIG=/path/to/pg_config make installcheck
+/usr/local/pgsql-devel/lib/pgxs/src/makefiles/../../src/test/regress/pg_regress --inputdir=./ --bindir='/usr/local/pgsql-devel/bin'    --dbname=contrib_regression tcle
+(using postmaster on Unix socket, default port)
+============== dropping database "contrib_regression" ==============
+DROP DATABASE
+============== creating database "contrib_regression" ==============
+CREATE DATABASE
+ALTER DATABASE
+============== running regression test queries        ==============
+test tcle                         ... ok           95 ms
+
+=====================
+ All 1 tests passed. 
+=====================
+
+```
+
 ## Usage
 
 1. Extension creation:
