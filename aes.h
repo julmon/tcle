@@ -5,6 +5,7 @@
 #define AES_IVLEN			16
 #define AES_KEYLEN			32
 
+#define AES_INVALID_FLAG	-1
 #define AES_ENCRYPT_FLAG	0
 #define AES_DECRYPT_FLAG	1
 #define AES_NOCRYPT_FLAG	2

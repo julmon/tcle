@@ -32,6 +32,7 @@ new_kkact(void)
 	kkact->nspname = NULL;		/* schema name */
 	kkact->new_nspname = NULL;	/* new table name */
 	kkact->new_relname = NULL;	/* new schema name */
+	kkact->ctas_key = NULL;		/* CREATE TABLE AS transient key */
 
 	return kkact;
 }
@@ -98,6 +99,7 @@ ApplyKMSKeyActions(List *actions, unsigned char *master_key)
 		switch (kkact->action_tag)
 		{
 			case AT_ADD_KEY:
+			case AT_ADD_CTAS_KEY:
 			{
 				/*
 				 * Table using tcleam AM creation case: we have to build a new
@@ -121,10 +123,26 @@ ApplyKMSKeyActions(List *actions, unsigned char *master_key)
 				}
 				memcpy(VARDATA(cipher_key), iv, AES_IVLEN);
 
-				if (!pg_strong_random(plain_key, AES_KEYLEN))
+				if (kkact->action_tag == AT_ADD_KEY)
 				{
-					ereport(ERROR,
-							(errmsg("tcle: could not generate random key")));
+					if (!pg_strong_random(plain_key, AES_KEYLEN))
+					{
+						ereport(ERROR,
+								(errmsg("tcle: could not generate random key")));
+					}
+				}
+				else if (kkact->action_tag == AT_ADD_CTAS_KEY)
+				{
+					/*
+					 * In CREATE TABLE AS context, transient key has been
+					 * already generated and used to encrypt data. So, we have
+					 * to store this key into KMS table now.
+					 */
+					if (kkact->ctas_key == NULL)
+						ereport(ERROR,
+								(errmsg("tcle: transient CTAS key not set")));
+
+					memcpy(plain_key, kkact->ctas_key, AES_KEYLEN);
 				}
 
 				/* AES encryption of the key */
