@@ -7,6 +7,7 @@
 #define AT_MOV_KEY		3
 #define AT_DEL_NSP_KEY  4
 #define AT_MOV_NSP_KEY  5
+#define AT_ADD_CTAS_KEY 6
 
 /* Shared memory lock for master keys hash table */
 typedef struct ShmemKMSMasterKeysLock {
@@ -30,6 +31,7 @@ typedef struct KMSKeyAction {
 	char		   *new_relname;
 	char		   *new_nspname;
 	int				action_tag;
+	unsigned char  *ctas_key;
 } KMSKeyAction;
 
 typedef struct KMSKeyCacheEntry {

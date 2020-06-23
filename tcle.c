@@ -45,6 +45,7 @@
 #include "storage/lmgr.h"
 #include "storage/bufmgr.h"
 #include "storage/smgr.h"
+#include "storage/proc.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -65,19 +66,20 @@ PG_MODULE_MAGIC;
 	(OID == ARRAY[0] || OID == ARRAY[1] || OID == ARRAY[2])
 
 /*
- * UtilityCryptFlag* struct are used to store in a htab (local to backend) a
- * flag related to current command. This flag will allow to disable encryption
- * / decryption for some utility statements like VACUUM FULL or CLUSTER.
+ * CommandCryptState* struct are used to store in a htab (local to backend) a
+ * flag or transient key related to current command. The flag will be use to
+ * disable encryption / decryption for some utility statements like VACUUM FULL
+ * or CLUSTER.
  */
-typedef struct UtilityCryptFlagKey {
-	TransactionId	xid; /* Current Transaction ID */
-	CommandId		cid; /* Command ID */
-} UtilityCryptFlagKey;
+typedef struct CommandCryptStateKey {
+	LocalTransactionId	lxid; /* Local Transaction ID */
+} CommandCryptStateKey;
 
-typedef struct UtilityCryptFlagEntry {
-	UtilityCryptFlagKey key;
+typedef struct CommandCryptStateEntry {
+	CommandCryptStateKey key;
 	int8			flag;
-} UtilityCryptFlagEntry;
+	unsigned char  *transient_key;
+} CommandCryptStateEntry;
 
 /* Array of encryptable data type names currently implemented */
 static const char *encrypt_types[N_ENCRYPT_TYPES] = {"encrypt_text",
@@ -92,7 +94,7 @@ static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 static ShmemKMSMasterKeysLock *shmmasterkeyslock = NULL;
 static ShmemKMSKeyCache *shmkeycache = NULL;
 static HTAB *shmmasterkeys = NULL;
-static HTAB *utilityflags = NULL;
+static HTAB *command_crypt_state = NULL;
 
 extern Datum encrypt_text_in(PG_FUNCTION_ARGS);
 extern Datum encrypt_text_out(PG_FUNCTION_ARGS);
@@ -106,13 +108,16 @@ static HeapTuple EncryptDecryptHeapTuple(HeapTuple tuple, TupleDesc tupleDesc,
 static void LoadTableKey(Oid databaseId, Oid tableId,
 						 unsigned char **table_keyPtr);
 static void get_encrypt_type_oids(Oid **oidsPtr);
-static void utility_flags_init(void);
-static void utility_flags_set(TransactionId xid, CommandId cid, int8 flag);
-static void utility_flags_remove(TransactionId xid, CommandId cid);
-static void utility_flags_mcb(void *arg);
+static void command_crypt_state_init(void);
+static void command_crypt_state_set(LocalTransactionId lxid, int8 flag,
+									unsigned char *tkey);
+static void command_crypt_state_rm(LocalTransactionId lxid);
+static void command_crypt_state_mcb(void *arg);
 static bool ShouldEncryptDecryptTTS(void);
 static void SetNotEncryptDecryptTTS(void);
-static void ResetNotEncryptDecryptTTS(void);
+static void RemoveCommandCryptState(void);
+static void BuildCommandTransientKey(void);
+static bool GetCommandTransientKey(unsigned char **tkeyPtr);
 
 void _PG_init(void);
 void _PG_fini(void);
@@ -394,10 +399,8 @@ tcle_ProcessUtility(PlannedStmt *pstmt,
 		{
 			/*
 			 * CREATE TABLE .. AS is a special case because we must generate
-			 * and store a new AES key right before the DDL is executed by
-			 * standard_ProcessUtility().
-			 * At the moment, we don't support it.. but we'll have to at some
-			 * point.
+			 * and store in memory a transient AES key right before the DDL is
+			 * executed by standard_ProcessUtility().
 			 */
 			CreateTableAsStmt  *stmt;
 
@@ -405,8 +408,8 @@ tcle_ProcessUtility(PlannedStmt *pstmt,
 
 			if (stmt->into->accessMethod
 					&& strcmp(stmt->into->accessMethod, "tcleam") == 0)
-				ereport(ERROR,
-						(errmsg("tcle: CREATE TABLE AS not supported for now")));
+				BuildCommandTransientKey();
+
 			break;
 		}
 
@@ -502,6 +505,46 @@ tcle_ProcessUtility(PlannedStmt *pstmt,
 			break;
 		}
 
+		case T_CreateTableAsStmt:
+		{
+			/*
+			 * End of CREATE TABLE .. AS special case: we have now to build a
+			 * new KMSKeyAction and push the action to further add the
+			 * transient key in KMS table.
+			 */
+			CreateTableAsStmt  *stmt;
+			KMSKeyAction	   *kkact;
+
+			stmt = (CreateTableAsStmt *) parsetree;
+
+			if (!stmt->into->accessMethod
+					|| strcmp(stmt->into->accessMethod, "tcleam") != 0)
+				break;
+
+			kkact = RelationGetKMSKeyAction(stmt->into->rel);
+
+			kkact->action_tag = AT_ADD_CTAS_KEY;
+			kkact->ctas_key = (unsigned char *) palloc(AES_KEYLEN);
+
+			if (!GetCommandTransientKey(&(kkact->ctas_key)))
+			{
+				/*
+				 * CTAS but no transient key found ?
+				 * This case should not happen but we handle it just in case.
+				 */
+
+				pfree(kkact->ctas_key);
+				pfree(kkact);
+
+				ereport(ERROR, (errmsg("tcle: transient key not found")));
+			}
+
+			RemoveCommandCryptState();
+
+			actions = lappend(actions, kkact);
+			break;
+		}
+
 		default:
 		{
 			break;
@@ -511,6 +554,7 @@ tcle_ProcessUtility(PlannedStmt *pstmt,
 	if (actions != NIL)
 	{
 		unsigned char	*master_key;
+
 		master_key = (unsigned char *) palloc(AES_KEYLEN);
 
 		/* Get master key from shared memory */
@@ -521,6 +565,8 @@ tcle_ProcessUtility(PlannedStmt *pstmt,
 
 		/* Apply KMS changes */
 		ApplyKMSKeyActions(actions, master_key);
+
+		list_free(actions);
 	}
 }
 
@@ -762,7 +808,7 @@ get_encrypt_type_oids(Oid ** oidsPtr)
  * Encrypt / decrypt tuple attributes from a TupleTableSlot.
  */
 static void
-EncryptDecryptTupleTableSlot(TupleTableSlot *slot, int8 flag)
+EncryptDecryptTupleTableSlot(TupleTableSlot *slot, int8 flag, Oid tableId)
 {
 	/* Number of attributes (columns) */
 	int				natts;
@@ -774,6 +820,7 @@ EncryptDecryptTupleTableSlot(TupleTableSlot *slot, int8 flag)
 	Oid			   *type_oids;
 	BufferHeapTupleTableSlot *bslot;
 	MemoryContext	oldContext;
+	bool			materialize;
 
 	if (!ShouldEncryptDecryptTTS())
 		return;
@@ -808,34 +855,57 @@ EncryptDecryptTupleTableSlot(TupleTableSlot *slot, int8 flag)
 		return;
 	}
 
+	/*
+	 * If tableId argument is not a valid Oid, let's consider that TTS contains
+	 * the right table id.
+	 */
+	if (!OidIsValid(tableId))
+		tableId = slot->tts_tableOid;
+
 	/* Load table's key */
 	table_key = (unsigned char *) palloc(AES_KEYLEN);
-	LoadTableKey(MyDatabaseId, slot->tts_tableOid, &table_key);
+	LoadTableKey(MyDatabaseId, tableId, &table_key);
+
+	/* Do not materialize if we're dealing with virtual tuple */
+	materialize = (slot->tts_ops != &TTSOpsVirtual);
 
 	/* Fetch tuple from the slot */
 	bslot = (BufferHeapTupleTableSlot *) slot;
-	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFreeTuple);
+	tuple = ExecFetchSlotHeapTuple(slot, materialize, &shouldFreeTuple);
 
 	/* Tuple encryption / decryption */
 	new_tuple = EncryptDecryptHeapTuple(tuple, slot->tts_tupleDescriptor,
-										slot->tts_tableOid, flag, table_key,
-										type_oids);
+										tableId, flag, table_key, type_oids);
 
-	/* The Slot has been materialized, so we can free the buffer tuple */
-	heap_freetuple(bslot->base.tuple);
+	if (slot->tts_ops == &TTSOpsVirtual)
+	{
+		/*
+		 * Virtual tuples (coming from CTAS) should not be materialized and can
+		 * be stored with ExecForceStoreHeapTuple() as is.
+		 */
+		ExecForceStoreHeapTuple(new_tuple, slot, true);
+	}
+	else if (slot->tts_ops == &TTSOpsBufferHeapTuple)
+	{
+		/* The Slot has been materialized, so we can free the buffer tuple */
+		heap_freetuple(bslot->base.tuple);
 
-	/* Tuple duplication into TTS memory context */
-	oldContext = MemoryContextSwitchTo(slot->tts_mcxt);
-	bslot->base.tuple = heap_copytuple(new_tuple);
-	MemoryContextSwitchTo(oldContext);
+		/* Tuple duplication into TTS memory context */
+		oldContext = MemoryContextSwitchTo(slot->tts_mcxt);
+		bslot->base.tuple = heap_copytuple(new_tuple);
+		MemoryContextSwitchTo(oldContext);
 
-	/* Copy ctid and flag the TTS */
-	slot->tts_tid = new_tuple->t_self;
-	slot->tts_flags |= TTS_FLAG_SHOULDFREE;
+		/* Copy ctid, and flag the TTS */
+		slot->tts_tid = new_tuple->t_self;
+		slot->tts_flags |= TTS_FLAG_SHOULDFREE;
+
+		heap_freetuple(new_tuple);
+	}
+	else
+		ereport(ERROR, (errmsg("tcle: unsupported type of TTS")));
 
 	if (shouldFreeTuple)
 		heap_freetuple(tuple);
-	heap_freetuple(new_tuple);
 	pfree(table_key);
 	pfree(type_oids);
 }
@@ -851,25 +921,51 @@ LoadTableKey(Oid databaseId, Oid tableId, unsigned char **table_keyPtr)
 	unsigned char  *master_key;
 	bytea		   *table_cipher_key;
 
+	/* Cache lookup first */
 	if (CacheGetRelationKey(shmkeycache, databaseId, tableId, table_keyPtr))
 		return;
 
+	/* Try to get table's key from KMS table */
+	table_cipher_key = (bytea *) palloc(AES_IVLEN + AES_KEYLEN + AES_BLOCKLEN);
+	if (!GetKMSCipherKey(tableId, &table_cipher_key))
+	{
+		pfree(table_cipher_key);
+
+		/* If not found in KMS, maybe we have a transient key ? */
+		if (GetCommandTransientKey(table_keyPtr))
+		{
+			/* If found, we put it into the cache */
+			CacheAddRelationKey(shmkeycache, databaseId, tableId,
+								*table_keyPtr);
+			return;
+		}
+		else
+			ereport(ERROR, (errmsg("tcle: could not find table's key")));
+	}
+
+	/*
+	 * At this point we've found table's cipher key in KMS table, now we have
+	 * to decrypt it with the master key and put it in cache.
+	 */
 	master_key = (unsigned char *) palloc(AES_KEYLEN);
 
 	/* Get master key from shared memory */
 	if (!GetDatabaseMasterKey(shmmasterkeyslock, shmmasterkeys, databaseId,
 							  &master_key))
+	{
+		pfree(table_cipher_key);
+		pfree(master_key);
 		ereport(ERROR,
 				(errmsg("tcle: master key not found for this database")));
+	}
 
-	table_cipher_key = (bytea *) palloc(AES_IVLEN + AES_KEYLEN + AES_BLOCKLEN);
-
-	/* Load and decrypt table's key */
-	if (!GetKMSCipherKey(tableId, &table_cipher_key))
-		ereport(ERROR, (errmsg("tcle: could not get table's key")));
-
+	/* Decrypt table's cipher key */
 	if (!DecryptKMSCipherKey(table_cipher_key, master_key, table_keyPtr))
+	{
+		pfree(table_cipher_key);
+		pfree(master_key);
 		ereport(ERROR, (errmsg("tcle: could not decrypt table's cipher key")));
+	}
 
 	pfree(table_cipher_key);
 	pfree(master_key);
@@ -1057,38 +1153,38 @@ error_decrypt:
 }
 
 /*
- * Initializes utilityflags HTAB into TopTransaction memory context. The main
- * goal here is to destroy and free the htab whatever is going on at the end of
- * the transaction. Even if the htab is automatically freed when the memory
- * context is destroyed, we still have to reset utilitflags to NULL if we want
- * to reuse it and create a new htab for the next transaction (within the same
- * backend). That's why we add a memory context reset callback in charge of
- * reseting utilityflags to NULL.
+ * Initializes command_crypt_state HTAB into TopTransaction memory context. The
+ * main goal here is to destroy and free the htab whatever is going on at the
+ * end of the transaction. Even if the htab is automatically freed when the
+ * memory context is destroyed, we still have to reset command_crypt_state to
+ * NULL if we want to reuse it and create a new htab for the next transaction
+ * (within the same backend). That's why we add a memory context reset
+ * callback in charge of reseting command_crypt_state to NULL.
  */
 static void
-utility_flags_init(void)
+command_crypt_state_init(void)
 {
 	HASHCTL		ctl;
 	MemoryContextCallback *mcb;
 	MemoryContext oldContext;
 
 	MemSet(&ctl, 0, sizeof(ctl));
-	ctl.keysize = sizeof(UtilityCryptFlagKey);
-	ctl.entrysize = sizeof(UtilityCryptFlagEntry);
+	ctl.keysize = sizeof(CommandCryptStateKey);
+	ctl.entrysize = sizeof(CommandCryptStateEntry);
 	ctl.hcxt = TopTransactionContext;
 
 	/*
 	 * Create the htab with only 1 element. This is not a shared-memory
 	 * htab, so it can be resized if needed.
 	 */
-	utilityflags = hash_create("utilityflags", 1, &ctl,
-							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	command_crypt_state = hash_create("command_crypt_state", 1, &ctl,
+									  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
 	/* Callback struct must be allocated into target memory context */
 	oldContext = MemoryContextSwitchTo(TopTransactionContext);
 
 	mcb = (MemoryContextCallback *) palloc(sizeof(MemoryContextCallback));
-	mcb->func = utility_flags_mcb;
+	mcb->func = command_crypt_state_mcb;
 	mcb->arg = NULL;
 
 	MemoryContextSwitchTo(oldContext);
@@ -1096,52 +1192,65 @@ utility_flags_init(void)
 }
 
 /*
- * Memory context reset callback to reset utilityflags.
+ * Memory context reset callback to reset command_crypt_state.
  */
 static void
-utility_flags_mcb(void *arg)
+command_crypt_state_mcb(void *arg)
 {
-	if (utilityflags != NULL)
-		utilityflags = NULL;
+	if (command_crypt_state != NULL)
+		command_crypt_state = NULL;
 }
 
 /*
- * Add a new entry into utilityflags htab. This routine initializes the htab if
- * needed.
+ * Add a new entry into command_crypt_state htab. This routine initializes the
+ * htab if needed.
  */
 static void
-utility_flags_set(TransactionId xid, CommandId cid, int8 flag)
+command_crypt_state_set(LocalTransactionId lxid, int8 flag,
+						unsigned char *tkey)
 {
-	UtilityCryptFlagKey *hkey;
-	UtilityCryptFlagEntry *entry;
+	CommandCryptStateKey *hkey;
+	CommandCryptStateEntry *entry;
+	bool		found;
 
-	if (utilityflags == NULL)
-		utility_flags_init();
+	if (command_crypt_state == NULL)
+		command_crypt_state_init();
 
-	hkey = (UtilityCryptFlagKey *) palloc(sizeof(UtilityCryptFlagKey));
-	hkey->xid = xid;
-	hkey->cid = cid;
+	hkey = (CommandCryptStateKey *) palloc(sizeof(CommandCryptStateKey));
+	hkey->lxid = lxid;
 
-	entry = (UtilityCryptFlagEntry *) hash_search(utilityflags, hkey,
-												  HASH_ENTER, NULL);
-	entry->flag = flag;
+	entry = (CommandCryptStateEntry *) hash_search(command_crypt_state, hkey,
+												   HASH_ENTER, &found);
+	if (!found)
+	{
+		entry->flag = AES_INVALID_FLAG;
+		entry->transient_key = NULL;
+	}
+
+	if (flag != AES_INVALID_FLAG)
+		entry->flag = flag;
+
+	if (tkey != NULL)
+	{
+		entry->transient_key = (unsigned char *) palloc(AES_KEYLEN);
+		memcpy(entry->transient_key, tkey, AES_KEYLEN);
+	}
 
 	pfree(hkey);
 }
 
 /*
- * Remove an entry from utilityflags htab.
+ * Remove an entry from command_crypt_state htab.
  */
 static void
-utility_flags_remove(TransactionId xid, CommandId cid)
+command_crypt_state_rm(LocalTransactionId lxid)
 {
-	UtilityCryptFlagKey *hkey;
+	CommandCryptStateKey *hkey;
 
-	hkey = (UtilityCryptFlagKey *) palloc(sizeof(UtilityCryptFlagKey));
-	hkey->xid = xid;
-	hkey->cid = cid;
+	hkey = (CommandCryptStateKey *) palloc(sizeof(CommandCryptStateKey));
+	hkey->lxid = lxid;
 
-	hash_search(utilityflags, hkey, HASH_REMOVE, NULL);
+	hash_search(command_crypt_state, hkey, HASH_REMOVE, NULL);
 
 	pfree(hkey);
 }
@@ -1153,28 +1262,22 @@ utility_flags_remove(TransactionId xid, CommandId cid)
 static bool
 ShouldEncryptDecryptTTS(void)
 {
-	TransactionId	xid;
-	CommandId		cid;
+	LocalTransactionId lxid;
 	bool			found;
 	bool			shouldCrypt = true;
-	UtilityCryptFlagKey *hkey;
-	UtilityCryptFlagEntry *entry;
+	CommandCryptStateKey *hkey;
+	CommandCryptStateEntry *entry;
 
-	xid = GetCurrentTransactionIdIfAny();
-	cid = GetCurrentCommandId(false);
+	lxid = MyProc->lxid;
 
-	if (xid == InvalidTransactionId)
+	if (command_crypt_state == NULL)
 		return true;
 
-	if (utilityflags == NULL)
-		return true;
+	hkey = (CommandCryptStateKey *) palloc(sizeof(CommandCryptStateKey));
+	hkey->lxid = lxid;
 
-	hkey = (UtilityCryptFlagKey *) palloc(sizeof(UtilityCryptFlagKey));
-	hkey->xid = xid;
-	hkey->cid = cid;
-
-	entry = (UtilityCryptFlagEntry *) hash_search(utilityflags, hkey,
-												  HASH_FIND, &found);
+	entry = (CommandCryptStateEntry *) hash_search(command_crypt_state, hkey,
+												   HASH_FIND, &found);
 
 	if (found && entry->flag == AES_NOCRYPT_FLAG)
 		shouldCrypt = false;
@@ -1190,28 +1293,78 @@ ShouldEncryptDecryptTTS(void)
 static void
 SetNotEncryptDecryptTTS(void)
 {
-	TransactionId	xid;
-	CommandId		cid;
+	LocalTransactionId lxid;
 
-	xid = GetCurrentTransactionIdIfAny();
-	cid = GetCurrentCommandId(false);
+	lxid = MyProc->lxid;
 
-	utility_flags_set(xid, cid, AES_NOCRYPT_FLAG);
+	command_crypt_state_set(lxid, AES_NOCRYPT_FLAG, NULL);
 }
 
 /*
- * Remove flag if any.
+ * Remove entry from command_crypt_state HTAB.
  */
 static void
-ResetNotEncryptDecryptTTS(void)
+RemoveCommandCryptState(void)
 {
-	TransactionId	xid;
-	CommandId		cid;
+	LocalTransactionId lxid;
 
-	xid = GetCurrentTransactionIdIfAny();
-	cid = GetCurrentCommandId(false);
+	lxid = MyProc->lxid;
 
-	utility_flags_remove(xid, cid);
+	command_crypt_state_rm(lxid);
+}
+
+/*
+ * Generate a random transient AES key and store it into command_crypt_state
+ * HTAB. This is necessary to handle CREATE TABLE .. AS statements because we
+ * need an encryption key before standard_ProcessUtility() is executed, and
+ * then store this key into KMS table at the end.
+ */
+static void
+BuildCommandTransientKey(void)
+{
+	unsigned char  *tkey;
+	LocalTransactionId lxid;
+
+	lxid = MyProc->lxid;
+	tkey = (unsigned char *) palloc(AES_KEYLEN);
+
+	if (!pg_strong_random(tkey, AES_KEYLEN))
+		ereport(ERROR,
+				(errmsg("tcle: could not generate transient CTAS key")));
+
+	command_crypt_state_set(lxid, AES_INVALID_FLAG, tkey);
+
+	pfree(tkey);
+}
+
+/*
+ * Get command's transient encryption key if any.
+ */
+static bool
+GetCommandTransientKey(unsigned char **tkeyPtr)
+{
+	LocalTransactionId lxid;
+	bool			found;
+	CommandCryptStateKey *hkey;
+	CommandCryptStateEntry *entry;
+
+	lxid = MyProc->lxid;
+
+	if (command_crypt_state == NULL)
+		return false;
+
+	hkey = (CommandCryptStateKey *) palloc(sizeof(CommandCryptStateKey));
+	hkey->lxid = lxid;
+
+	entry = (CommandCryptStateEntry *) hash_search(command_crypt_state, hkey,
+												   HASH_FIND, &found);
+
+	if (found && entry->transient_key != NULL)
+		memcpy(*tkeyPtr, entry->transient_key, AES_KEYLEN);
+
+	pfree(hkey);
+
+	return found;
 }
 
 /* ------------------------------------------------------------------------
@@ -1269,7 +1422,7 @@ tcleam_index_fetch_tuple(struct IndexFetchTableData *scan,
 	oldContext = MemoryContextSwitchTo(slot->tts_mcxt);
 
 	/* Apply AES decryption on tuple attributes */
-	EncryptDecryptTupleTableSlot(slot, AES_DECRYPT_FLAG);
+	EncryptDecryptTupleTableSlot(slot, AES_DECRYPT_FLAG, scan->rel->rd_id);
 
 	/* Back to AM routine memory context */
 	MemoryContextSwitchTo(oldContext);
@@ -1323,7 +1476,7 @@ tcleam_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
 	oldContext = MemoryContextSwitchTo(slot->tts_mcxt);
 
 	/* Apply AES decryption on tuple attributes */
-	EncryptDecryptTupleTableSlot(slot, AES_DECRYPT_FLAG);
+	EncryptDecryptTupleTableSlot(slot, AES_DECRYPT_FLAG, sscan->rs_rd->rd_id);
 
 	/* Back to AM routine memory context */
 	MemoryContextSwitchTo(oldContext);
@@ -1345,7 +1498,7 @@ tcleam_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
 	MemoryContext oldContext = MemoryContextSwitchTo(slot->tts_mcxt);
 
 	/* Apply AES encryption on tuple attributes */
-	EncryptDecryptTupleTableSlot(slot, AES_ENCRYPT_FLAG);
+	EncryptDecryptTupleTableSlot(slot, AES_ENCRYPT_FLAG, relation->rd_id);
 
 	/* Back to AM routine memory context */
 	MemoryContextSwitchTo(oldContext);
@@ -1363,7 +1516,7 @@ tcleam_tuple_insert_speculative(Relation relation, TupleTableSlot *slot,
 	MemoryContext oldContext = MemoryContextSwitchTo(slot->tts_mcxt);
 
 	/* Apply AES encryption on tuple attributes */
-	EncryptDecryptTupleTableSlot(slot, AES_ENCRYPT_FLAG);
+	EncryptDecryptTupleTableSlot(slot, AES_ENCRYPT_FLAG, relation->rd_id);
 
 	/* Back to AM routine memory context */
 	MemoryContextSwitchTo(oldContext);
@@ -1402,7 +1555,7 @@ tcleam_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 	MemoryContext oldContext = MemoryContextSwitchTo(slot->tts_mcxt);
 
 	/* Apply AES encryption on tuple attributes */
-	EncryptDecryptTupleTableSlot(slot, AES_ENCRYPT_FLAG);
+	EncryptDecryptTupleTableSlot(slot, AES_ENCRYPT_FLAG, relation->rd_id);
 
 	/* Back to AM routine memory context */
 	MemoryContextSwitchTo(oldContext);
@@ -1464,7 +1617,8 @@ tcleam_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		MemoryContext oldContext = MemoryContextSwitchTo(slots[i]->tts_mcxt);
 
 		/* Apply AES encryption on tuple attributes */
-		EncryptDecryptTupleTableSlot(slots[i], AES_ENCRYPT_FLAG);
+		EncryptDecryptTupleTableSlot(slots[i], AES_ENCRYPT_FLAG,
+									 relation->rd_id);
 
 		/* Back to AM routine memory context */
 		MemoryContextSwitchTo(oldContext);
@@ -1496,8 +1650,8 @@ tcleam_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 														 tups_vacuumed,
 														 tups_recently_dead);
 
-	/* Burn the flag */
-	ResetNotEncryptDecryptTTS();
+	/* Remove command crypt state entry */
+	RemoveCommandCryptState();
 }
 
 static bool
