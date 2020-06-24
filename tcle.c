@@ -134,13 +134,7 @@ static void tcle_ProcessUtility(PlannedStmt *pstmt,
 
 PG_FUNCTION_INFO_V1(tcleam_handler);
 PG_FUNCTION_INFO_V1(encrypt_text_in);
-PG_FUNCTION_INFO_V1(encrypt_text_out);
 PG_FUNCTION_INFO_V1(encrypt_text_recv);
-PG_FUNCTION_INFO_V1(encrypt_text_send);
-PG_FUNCTION_INFO_V1(encrypt_numeric_in);
-PG_FUNCTION_INFO_V1(encrypt_numeric_out);
-PG_FUNCTION_INFO_V1(encrypt_numeric_recv);
-PG_FUNCTION_INFO_V1(encrypt_numeric_send);
 PG_FUNCTION_INFO_V1(encrypt_timestamptz_in);
 PG_FUNCTION_INFO_V1(encrypt_timestamptz_out);
 PG_FUNCTION_INFO_V1(encrypt_timestamptz_recv);
@@ -587,19 +581,6 @@ encrypt_text_in(PG_FUNCTION_ARGS)
 }
 
 /*
- * encrypt_text type output function.
- */
-Datum
-encrypt_text_out(PG_FUNCTION_ARGS)
-{
-	/*
-	 * Ne need to go with DirectFunctionCall here, just call text type out
-	 * function with fcinfo.
-	 */
-	return textout(fcinfo);
-}
-
-/*
  * Converts external binary format to encrypt_text
  */
 Datum
@@ -623,51 +604,6 @@ encrypt_text_recv(PG_FUNCTION_ARGS)
 	result = cstring_to_text_with_len(str, nbytes);
 	pfree(str);
 	PG_RETURN_TEXT_P(result);
-}
-
-/*
- * Converts encrypt_text to external binary format
- */
-Datum
-encrypt_text_send(PG_FUNCTION_ARGS)
-{
-	return textsend(fcinfo);
-}
-
-/*
- * encrypt_numeric type input function.
- */
-Datum
-encrypt_numeric_in(PG_FUNCTION_ARGS)
-{
-	return numeric_in(fcinfo);
-}
-
-/*
- * encrypt_numeric type output function.
- */
-Datum
-encrypt_numeric_out(PG_FUNCTION_ARGS)
-{
-	return numeric_out(fcinfo);
-}
-
-/*
- * Converts external binary format to encrypt_numeric
- */
-Datum
-encrypt_numeric_recv(PG_FUNCTION_ARGS)
-{
-	return numeric_recv(fcinfo);
-}
-
-/*
- * Converts encrypt_numeric to external binary format
- */
-Datum
-encrypt_numeric_send(PG_FUNCTION_ARGS)
-{
-	return numeric_send(fcinfo);
 }
 
 /*
