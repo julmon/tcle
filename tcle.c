@@ -27,7 +27,9 @@
 #include "pgstat.h"
 #include "access/genam.h"
 #include "access/heapam.h"
+#if (PG_VERSION_NUM >= 130000)
 #include "access/heaptoast.h"
+#endif
 #include "access/rewriteheap.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
@@ -124,6 +126,7 @@ void _PG_fini(void);
 
 /* Hook function */
 static void tcle_shmem_startup(void);
+#if (PG_VERSION_NUM >= 130000)
 static void tcle_ProcessUtility(PlannedStmt *pstmt,
 								const char *queryString,
 								ProcessUtilityContext context,
@@ -131,6 +134,15 @@ static void tcle_ProcessUtility(PlannedStmt *pstmt,
 								QueryEnvironment *queryEnv,
 								DestReceiver *dest,
 								QueryCompletion *qc);
+#elif (PG_VERSION_NUM >= 120000)
+static void tcle_ProcessUtility(PlannedStmt *pstmt,
+								const char *queryString,
+								ProcessUtilityContext context,
+								ParamListInfo params,
+								QueryEnvironment *queryEnv,
+								DestReceiver *dest,
+								char *qc);
+#endif
 
 PG_FUNCTION_INFO_V1(tcleam_handler);
 PG_FUNCTION_INFO_V1(encrypt_text_in);
@@ -259,6 +271,7 @@ RelationAMIsTcleam(Oid relid)
  * we must do it after.
  */
 void
+#if (PG_VERSION_NUM >= 130000)
 tcle_ProcessUtility(PlannedStmt *pstmt,
 					const char *queryString,
 					ProcessUtilityContext context,
@@ -266,6 +279,15 @@ tcle_ProcessUtility(PlannedStmt *pstmt,
 					QueryEnvironment *queryEnv,
 					DestReceiver *dest,
 					QueryCompletion *qc)
+#elif (PG_VERSION_NUM >= 120000)
+tcle_ProcessUtility(PlannedStmt *pstmt,
+					const char *queryString,
+					ProcessUtilityContext context,
+					ParamListInfo params,
+					QueryEnvironment *queryEnv,
+					DestReceiver *dest,
+					char *qc)
+#endif
 {
 	Node		   *parsetree = pstmt->utilityStmt;
 	List		   *actions = NIL;
@@ -1620,12 +1642,13 @@ tcleam_relation_needs_toast_table(Relation rel)
 	return GetHeapamTableAmRoutine()->relation_needs_toast_table(rel);
 }
 
+#if (PG_VERSION_NUM >= 130000)
 static Oid
 tcleam_relation_toast_am(Relation rel)
 {
 	return GetHeapamTableAmRoutine()->relation_toast_am(rel);
 }
-
+#endif
 
 /* ------------------------------------------------------------------------
  * Planner related callbacks
@@ -1693,6 +1716,20 @@ tcleam_beginscan(Relation rel, Snapshot snapshot, int nkeys,
 	return heap_beginscan(rel, snapshot, nkeys, key, parallel_scan, flags);
 }
 
+static uint64
+tcleam_relation_size(Relation rel, ForkNumber forkNumber)
+{
+	return GetHeapamTableAmRoutine()->relation_size(rel, forkNumber);
+}
+
+#if (PG_VERSION_NUM >= 120000 && PG_VERSION_NUM < 130000)
+static void
+tcleam_finish_bulk_insert(Relation rel, int options)
+{
+	GetHeapamTableAmRoutine()->finish_bulk_insert(rel, options);
+}
+#endif
+
 static const TableAmRoutine tcleam_methods = {
 	.type = T_TableAmRoutine,
 
@@ -1719,6 +1756,9 @@ static const TableAmRoutine tcleam_methods = {
 	.tuple_delete = tcleam_tuple_delete,
 	.tuple_update = tcleam_tuple_update,
 	.tuple_lock = tcleam_tuple_lock,
+#if (PG_VERSION_NUM >= 120000 && PG_VERSION_NUM < 130000)
+	.finish_bulk_insert = tcleam_finish_bulk_insert,
+#endif
 
 	.tuple_fetch_row_version = tcleam_fetch_row_version,
 	.tuple_get_latest_tid = tcleam_get_latest_tid,
@@ -1735,10 +1775,12 @@ static const TableAmRoutine tcleam_methods = {
 	.index_build_range_scan = tcleam_index_build_range_scan,
 	.index_validate_scan = tcleam_index_validate_scan,
 
-	.relation_size = table_block_relation_size,
+	.relation_size = tcleam_relation_size,
 	.relation_needs_toast_table = tcleam_relation_needs_toast_table,
+#if (PG_VERSION_NUM >= 130000)
 	.relation_toast_am = tcleam_relation_toast_am,
 	.relation_fetch_toast_slice = heap_fetch_toast_slice,
+#endif
 
 	.relation_estimate_size = tcleam_estimate_rel_size,
 
