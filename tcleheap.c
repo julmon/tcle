@@ -23,6 +23,9 @@
  */
 
 #include "postgres.h"
+#if (PG_VERSION_NUM >= 120000 && PG_VERSION_NUM < 130000)
+#include "miscadmin.h"
+#endif
 #include "pgstat.h"
 #include "access/genam.h"
 #include "access/heapam.h"
@@ -253,11 +256,15 @@ heapgettup(HeapScanDesc scan,
 				valid = HeapTupleSatisfiesVisibility(tuple,
 													 snapshot,
 													 scan->rs_cbuf);
-
+#if (PG_VERSION_NUM_NUM >= 130000)
 				HeapCheckForSerializableConflictOut(valid, scan->rs_base.rs_rd,
 													tuple, scan->rs_cbuf,
 													snapshot);
-
+#elif (PG_VERSIION >= 120000)
+				CheckForSerializableConflictOut(valid, scan->rs_base.rs_rd,
+												tuple, scan->rs_cbuf,
+												snapshot);
+#endif
 				if (valid && key != NULL)
 					HeapKeyTest(tuple, RelationGetDescr(scan->rs_base.rs_rd),
 								nkeys, key, valid);
@@ -1192,6 +1199,7 @@ tcleam_index_build_range_scan(Relation heapRelation,
 			 * For a heap-only tuple, pretend its TID is that of the root. See
 			 * src/backend/access/heap/README.HOT for discussion.
 			 */
+#if (PG_VERSION_NUM >= 130000)
 			ItemPointerData tid;
 			OffsetNumber offnum;
 
@@ -1217,6 +1225,34 @@ tcleam_index_build_range_scan(Relation heapRelation,
 			/* Call the AM's callback routine to process the tuple */
 			callback(indexRelation, &heapTuple->t_self, values, isnull,
 					 tupleIsAlive, callback_state);
+#elif (PG_VERSION_NUM >= 120000)
+			HeapTupleData rootTuple;
+			OffsetNumber offnum;
+
+			rootTuple = *heapTuple;
+			offnum = ItemPointerGetOffsetNumber(&heapTuple->t_self);
+
+			if (!OffsetNumberIsValid(root_offsets[offnum - 1]))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg_internal("failed to find parent tuple for heap-only tuple at (%u,%u) in table \"%s\"",
+										 ItemPointerGetBlockNumber(&heapTuple->t_self),
+										 offnum,
+										 RelationGetRelationName(heapRelation))));
+
+			ItemPointerSetOffsetNumber(&rootTuple.t_self,
+									   root_offsets[offnum - 1]);
+
+			/* Call the AM's callback routine to process the tuple */
+			callback(indexRelation, &rootTuple, values, isnull, tupleIsAlive,
+					 callback_state);
+		}
+		else
+		{
+			/* Call the AM's callback routine to process the tuple */
+			callback(indexRelation, heapTuple, values, isnull, tupleIsAlive,
+					 callback_state);
+#endif
 		}
 	}
 

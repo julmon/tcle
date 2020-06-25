@@ -12,6 +12,9 @@
 
 #include "postgres.h"
 #include "catalog/namespace.h"
+#if (PG_VERSION_NUM >= 120000 && PG_VERSION_NUM < 130000)
+#include "catalog/pg_type_d.h"
+#endif
 #include "executor/spi.h"
 #include "utils/lsyscache.h"
 

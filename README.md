@@ -44,8 +44,7 @@ TCLE provides 3 new data types to identify the columns to be encrypted:
 
 ## PostgreSQL versions support
 
-TCLE works only with PostgreSQL 13. With some efforts, it could works with
-PostgreSQL 12.
+TCLE works with PostgreSQL 12 and 13 (currently in beta2 stage - 2020-06-25).
 
 ## Installation
 
