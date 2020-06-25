@@ -2,7 +2,7 @@ CREATE EXTENSION tcle;
 SELECT tcle_set_passphrase('my secret passphrase');
 -- Test CREATE TABLE statement and implicit casts
 CREATE TABLE t (p INTEGER, n ENCRYPT_NUMERIC, l ENCRYPT_TEXT, d ENCRYPT_TIMESTAMPTZ) USING tcleam;
-INSERT INTO t SELECT i, i * 2, 'Text input number '||i, '2020-06-23 22:56:50'::TIMESTAMPTZ + make_interval(days => i) FROM generate_series(1, 10) i;
+INSERT INTO t SELECT i, i * 2, 'Text input number '||i, '2020-06-23 22:56:50'::TIMESTAMPTZ + make_interval(days => i) FROM generate_series(1, 100) i;
 SELECT COUNT(*) FROM t;
 SELECT p, n, l, d FROM t WHERE n = 6;
 -- Test UPDATE statement
@@ -23,6 +23,10 @@ CREATE TABLE t_i (i INTEGER PRIMARY KEY, l ENCRYPT_TEXT) USING tcleam;
 INSERT INTO t_i SELECT n, 'Message n°'||n FROM generate_series(1, 10) n;
 SET enable_seqscan TO off;
 SELECT * FROM t_i WHERE i = 5;
+-- Test opertor classes
+SELECT * FROM t WHERE n >= 50 ORDER BY n DESC;
+SELECT * FROM t WHERE l < 'Text input number 3' ORDER BY l DESC;
+SELECT * FROM t WHERE d > '2020-08-01 00:00:00' ORDER BY d DESC;
 -- Setting a new passphrase when a master key is already in use should raise
 -- an error
 SELECT tcle_set_passphrase('wrong secret passphrase');
