@@ -15,11 +15,13 @@
 #if (PG_VERSION_NUM >= 120000 && PG_VERSION_NUM < 130000)
 #include "catalog/pg_type_d.h"
 #endif
+#include "commands/extension.h"
 #include "executor/spi.h"
 #include "utils/lsyscache.h"
 
 #include "aes.h"
 #include "kms.h"
+#include "utils.h"
 
 /*
  * Allocates a new KMSKeyAction struct and intializes it.
@@ -236,6 +238,14 @@ AddKMSCipherKey(char *nspname, char *relname, bytea *cipher_key)
 	Datum		   *values;
 	const char	   *nulls;
 	const char	   *query;
+	Oid				extensionId;
+	Oid				namespaceId;
+	char		   *namespaceName;
+
+	/* Fetch extension namespace name */
+	extensionId = get_extension_oid("tcle", false);
+	namespaceId = get_extension_schema(extensionId);
+	namespaceName = get_namespace_name(namespaceId);
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		return false;
@@ -252,11 +262,11 @@ AddKMSCipherKey(char *nspname, char *relname, bytea *cipher_key)
 	values[1] = CStringGetDatum(relname);
 	values[2] = PointerGetDatum(cipher_key);
 
-	query = "INSERT INTO tcle_table_keys (nspname, relname, cipher_key) "
+	query = "INSERT INTO \"%s\".tcle_table_keys (nspname, relname, cipher_key) "
 			"VALUES ($1, $2, $3)";
 
-	spi_res = SPI_execute_with_args(query , 3, argstypes, values, nulls, false,
-									0);
+	spi_res = SPI_execute_with_args(psprintf(query, namespaceName), 3,
+									argstypes, values, nulls, false, 0);
 
 	pfree(argstypes);
 	pfree(values);
@@ -277,6 +287,14 @@ DeleteKMSKey(char *nspname, char *relname)
 	Datum		   *values;
 	const char	   *nulls;
 	const char	   *query;
+	Oid				extensionId;
+	Oid				namespaceId;
+	char		   *namespaceName;
+
+	/* Fetch extension namespace name */
+	extensionId = get_extension_oid("tcle", false);
+	namespaceId = get_extension_schema(extensionId);
+	namespaceName = get_namespace_name(namespaceId);
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		return false;
@@ -291,10 +309,11 @@ DeleteKMSKey(char *nspname, char *relname)
 	values[0] = CStringGetDatum(nspname);
 	values[1] = CStringGetDatum(relname);
 
-	query = "DELETE FROM tcle_table_keys WHERE nspname = $1 AND relname = $2";
+	query = "DELETE FROM \"%s\".tcle_table_keys "
+			"WHERE nspname = $1 AND relname = $2";
 
-	spi_res = SPI_execute_with_args(query , 2, argstypes, values, nulls, false,
-									0);
+	spi_res = SPI_execute_with_args(psprintf(query, namespaceName), 2,
+									argstypes, values, nulls, false, 0);
 
 	pfree(argstypes);
 	pfree(values);
@@ -315,6 +334,14 @@ MoveKMSKey(char *nspname, char *relname, char *new_relname)
 	Datum		   *values;
 	const char	   *nulls;
 	const char	   *query;
+	Oid				extensionId;
+	Oid				namespaceId;
+	char		   *namespaceName;
+
+	/* Fetch extension namespace name */
+	extensionId = get_extension_oid("tcle", false);
+	namespaceId = get_extension_schema(extensionId);
+	namespaceName = get_namespace_name(namespaceId);
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		return false;
@@ -331,11 +358,11 @@ MoveKMSKey(char *nspname, char *relname, char *new_relname)
 	values[1] = CStringGetDatum(relname);
 	values[2] = CStringGetDatum(new_relname);
 
-	query = "UPDATE tcle_table_keys SET relname = $3 "
+	query = "UPDATE \"%s\".tcle_table_keys SET relname = $3 "
 			"WHERE nspname = $1 AND relname = $2";
 
-	spi_res = SPI_execute_with_args(query , 3, argstypes, values, nulls, false,
-									0);
+	spi_res = SPI_execute_with_args(psprintf(query, namespaceName), 3,
+									argstypes, values, nulls, false, 0);
 
 	pfree(argstypes);
 	pfree(values);
@@ -356,6 +383,14 @@ MoveNamespaceKMSKey(char *nspname, char *relname, char *new_nspname)
 	Datum		   *values;
 	const char	   *nulls;
 	const char	   *query;
+	Oid				extensionId;
+	Oid				namespaceId;
+	char		   *namespaceName;
+
+	/* Fetch extension namespace name */
+	extensionId = get_extension_oid("tcle", false);
+	namespaceId = get_extension_schema(extensionId);
+	namespaceName = get_namespace_name(namespaceId);
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		return false;
@@ -372,11 +407,11 @@ MoveNamespaceKMSKey(char *nspname, char *relname, char *new_nspname)
 	values[1] = CStringGetDatum(relname);
 	values[2] = CStringGetDatum(new_nspname);
 
-	query = "UPDATE tcle_table_keys SET nspname = $3 "
+	query = "UPDATE \"%s\".tcle_table_keys SET nspname = $3 "
 			"WHERE nspname = $1 AND relname = $2";
 
-	spi_res = SPI_execute_with_args(query , 3, argstypes, values, nulls, false,
-									0);
+	spi_res = SPI_execute_with_args(psprintf(query, namespaceName), 3,
+									argstypes, values, nulls, false, 0);
 
 	pfree(argstypes);
 	pfree(values);
@@ -397,6 +432,14 @@ MoveNamespaceKMSKeys(char *nspname, char *new_nspname)
 	Datum		   *values;
 	const char	   *nulls;
 	const char	   *query;
+	Oid				extensionId;
+	Oid				namespaceId;
+	char		   *namespaceName;
+
+	/* Fetch extension namespace name */
+	extensionId = get_extension_oid("tcle", false);
+	namespaceId = get_extension_schema(extensionId);
+	namespaceName = get_namespace_name(namespaceId);
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		return false;
@@ -411,10 +454,10 @@ MoveNamespaceKMSKeys(char *nspname, char *new_nspname)
 	values[0] = CStringGetDatum(nspname);
 	values[1] = CStringGetDatum(new_nspname);
 
-	query = "UPDATE tcle_table_keys SET nspname = $2 WHERE nspname = $1";
+	query = "UPDATE \"%s\".tcle_table_keys SET nspname = $2 WHERE nspname = $1";
 
-	spi_res = SPI_execute_with_args(query , 2, argstypes, values, nulls, false,
-									0);
+	spi_res = SPI_execute_with_args(psprintf(query, namespaceName), 2,
+									argstypes, values, nulls, false, 0);
 
 	pfree(argstypes);
 	pfree(values);
@@ -435,6 +478,14 @@ DeleteNamespaceKMSKeys(char *nspname)
 	Datum		   *values;
 	const char	   *nulls;
 	const char	   *query;
+	Oid				extensionId;
+	Oid				namespaceId;
+	char		   *namespaceName;
+
+	/* Fetch extension namespace name */
+	extensionId = get_extension_oid("tcle", false);
+	namespaceId = get_extension_schema(extensionId);
+	namespaceName = get_namespace_name(namespaceId);
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		return false;
@@ -447,10 +498,10 @@ DeleteNamespaceKMSKeys(char *nspname)
 
 	values[0] = CStringGetDatum(nspname);
 
-	query = "DELETE FROM tcle_table_keys WHERE nspname = $1";
+	query = "DELETE FROM \"%s\".tcle_table_keys WHERE nspname = $1";
 
-	spi_res = SPI_execute_with_args(query , 1, argstypes, values, nulls, false,
-									0);
+	spi_res = SPI_execute_with_args(psprintf(query, namespaceName), 1,
+									argstypes, values, nulls, false, 0);
 
 	pfree(argstypes);
 	pfree(values);
@@ -474,7 +525,14 @@ GetKMSCipherKey(Oid relid, bytea **cipher_keyPtr)
 	bool			isNull;
 	Datum			res_data;
 	int				data_len;
+	Oid				extensionId;
+	Oid				namespaceId;
+	char		   *namespaceName;
 
+	/* Fetch extension namespace name */
+	extensionId = get_extension_oid("tcle", false);
+	namespaceId = get_extension_schema(extensionId);
+	namespaceName = get_namespace_name(namespaceId);
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		return false;
@@ -486,11 +544,12 @@ GetKMSCipherKey(Oid relid, bytea **cipher_keyPtr)
 	argstypes[0] = OIDOID;
 	values[0] = ObjectIdGetDatum(relid);
 
-	query = "SELECT cipher_key FROM tcle_table_keys "
+	query = "SELECT cipher_key FROM \"%s\".tcle_table_keys "
 			"WHERE (nspname||'.'||relname)::regclass::oid = $1";
 
-	spi_res = SPI_execute_with_args(query, 1, argstypes, values, nulls, true,
-									0);
+	spi_res = SPI_execute_with_args(psprintf(query, namespaceName), 1,
+									argstypes, values, nulls, true, 0);
+
 	pfree(argstypes);
 	pfree(values);
 
@@ -547,14 +606,21 @@ CheckKMSMasterKey(unsigned char *master_key)
 	bool			isNull;
 	Datum			res_data;
 	unsigned char  *plain_buffer;
+	Oid				extensionId;
+	Oid				namespaceId;
+	char		   *namespaceName;
 
+	/* Fetch extension namespace name */
+	extensionId = get_extension_oid("tcle", false);
+	namespaceId = get_extension_schema(extensionId);
+	namespaceName = get_namespace_name(namespaceId);
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		ereport(ERROR, (errmsg("tcle: could not connect to SPI interface")));
 
-	query = "SELECT cipher_key FROM tcle_table_keys";
+	query = "SELECT cipher_key FROM \"%s\".tcle_table_keys";
 
-	spi_res = SPI_execute(query, true, 0);
+	spi_res = SPI_execute(psprintf(query, namespaceName), true, 0);
 
 	if (spi_res != SPI_OK_SELECT)
 	{

@@ -40,6 +40,7 @@
 #include "catalog/pg_type.h"
 #include "common/sha2.h"
 #include "commands/dbcommands.h"
+#include "commands/extension.h"
 #include "commands/progress.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
@@ -59,6 +60,7 @@
 #include "tcleheap.h"
 #include "aes.h"
 #include "kms.h"
+#include "utils.h"
 
 PG_MODULE_MAGIC;
 
@@ -746,13 +748,10 @@ static void
 get_encrypt_type_oids(Oid ** oidsPtr)
 {
 	Oid		namespaceId;
+	Oid		extensionId;
 
-	/*
-	 * FIXME: types Oid look up is done for "public" schema only, meaning that
-	 * if the extension is created within another schema, this lookup will
-	 * fail.
-	 */
-	namespaceId = get_namespace_oid("public", true);
+	extensionId = get_extension_oid("tcle", false);
+	namespaceId = get_extension_schema(extensionId);
 
 	for (int i = 0; i < N_ENCRYPT_TYPES; i++)
 	{
