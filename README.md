@@ -1,4 +1,5 @@
 [![CircleCI](https://circleci.com/gh/julmon/tcle.svg?style=shield)](https://app.circleci.com/pipelines/github/julmon/tcle?branch=master)
+![Experimental](https://img.shields.io/badge/status-experimental-orange)
 [![License](https://img.shields.io/github/license/julmon/tcle?color=%23008bb9)](https://github.com/julmon/tcle/blob/master/LICENSE.txt)
 
 # Transparent Cell-Level Encryption for PostgreSQL
