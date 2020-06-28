@@ -1,0 +1,4 @@
+SET search_path TO public, s1;
+-- Test UPDATE statement
+UPDATE t SET l = 'Updated text' WHERE n = 6;
+SELECT COUNT(*) FROM t WHERE l ILIKE '%updated%';

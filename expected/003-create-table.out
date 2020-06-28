@@ -1,0 +1,25 @@
+SET search_path TO public, s1;
+-- Test CREATE TABLE statement and implicit casts
+CREATE TABLE t (p INTEGER, n ENCRYPT_NUMERIC, l ENCRYPT_TEXT, d ENCRYPT_TIMESTAMPTZ) USING tcleam;
+INSERT INTO t SELECT i, i * 2, 'Text input number '||i, '2020-06-23 22:56:50'::TIMESTAMPTZ + make_interval(days => i) FROM generate_series(1, 100) i;
+SELECT COUNT(*) FROM t;
+ count 
+-------
+   100
+(1 row)
+
+SELECT ctid, * FROM t LIMIT 10;
+  ctid  | p  | n  |          l           |              d               
+--------+----+----+----------------------+------------------------------
+ (0,1)  |  1 | 2  | Text input number 1  | Wed Jun 24 22:56:50 2020 PDT
+ (0,2)  |  2 | 4  | Text input number 2  | Thu Jun 25 22:56:50 2020 PDT
+ (0,3)  |  3 | 6  | Text input number 3  | Fri Jun 26 22:56:50 2020 PDT
+ (0,4)  |  4 | 8  | Text input number 4  | Sat Jun 27 22:56:50 2020 PDT
+ (0,5)  |  5 | 10 | Text input number 5  | Sun Jun 28 22:56:50 2020 PDT
+ (0,6)  |  6 | 12 | Text input number 6  | Mon Jun 29 22:56:50 2020 PDT
+ (0,7)  |  7 | 14 | Text input number 7  | Tue Jun 30 22:56:50 2020 PDT
+ (0,8)  |  8 | 16 | Text input number 8  | Wed Jul 01 22:56:50 2020 PDT
+ (0,9)  |  9 | 18 | Text input number 9  | Thu Jul 02 22:56:50 2020 PDT
+ (0,10) | 10 | 20 | Text input number 10 | Fri Jul 03 22:56:50 2020 PDT
+(10 rows)
+
