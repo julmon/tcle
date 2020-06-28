@@ -12,6 +12,8 @@ PG_CONFIG=$PGPATH/bin/pg_config make -C ${DIR}/.. clean install
 
 sudo -u postgres $PGPATH/bin/psql -c "ALTER SYSTEM SET shared_preload_libraries TO 'tcle';"
 sudo -u postgres $PGPATH/bin/pg_ctl -D $PGDATA restart
+chmod -R a+rx /root
+chmod -R a+rwx ${DIR}/..
 sudo -u postgres PG_CONFIG=$PGPATH/bin/pg_config make -C ${DIR}/.. installcheck ||
 {
 	res=$?
