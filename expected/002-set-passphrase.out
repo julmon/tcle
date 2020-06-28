@@ -1,0 +1,7 @@
+SET search_path TO public, s1;
+SELECT tcle_set_passphrase('my secret passphrase');
+ tcle_set_passphrase 
+---------------------
+ t
+(1 row)
+

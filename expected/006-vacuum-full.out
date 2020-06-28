@@ -1,0 +1,9 @@
+SET search_path TO public, s1;
+-- Test VACUM FULL
+VACUUM FULL t;
+SELECT * FROM t WHERE l ILIKE '%updated%';
+ p | n |      l       |              d               
+---+---+--------------+------------------------------
+ 3 | 6 | Updated text | Fri Jun 26 22:56:50 2020 PDT
+(1 row)
+

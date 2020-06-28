@@ -1,0 +1,24 @@
+SET search_path TO public, s1;
+CREATE TABLE t_cpy (id ENCRYPT_NUMERIC, label ENCRYPT_TEXT, date ENCRYPT_TIMESTAMPTZ) USING tcleam;;
+COPY t_cpy (id, label, date) FROM stdin DELIMITER ';';
+SELECT * FROM t_cpy ORDER BY id ASC;
+ id |         label         |                date                
+----+-----------------------+------------------------------------
+ 1  | Message for copy n°1  | Mon Jun 29 12:47:10.25555 2020 PDT
+ 2  | Message for copy n°2  | Tue Jun 30 12:47:10.25555 2020 PDT
+ 3  | Message for copy n°3  | Wed Jul 01 12:47:10.25555 2020 PDT
+ 4  | Message for copy n°4  | Thu Jul 02 12:47:10.25555 2020 PDT
+ 5  | Message for copy n°5  | Fri Jul 03 12:47:10.25555 2020 PDT
+ 6  | Message for copy n°6  | Sat Jul 04 12:47:10.25555 2020 PDT
+ 7  | Message for copy n°7  | Sun Jul 05 12:47:10.25555 2020 PDT
+ 8  | Message for copy n°8  | Mon Jul 06 12:47:10.25555 2020 PDT
+ 9  | Message for copy n°9  | Tue Jul 07 12:47:10.25555 2020 PDT
+ 10 | Message for copy n°10 | Wed Jul 08 12:47:10.25555 2020 PDT
+ 11 | Message for copy n°11 | Thu Jul 09 12:47:10.25555 2020 PDT
+ 12 | Message for copy n°12 | Fri Jul 10 12:47:10.25555 2020 PDT
+ 13 | Message for copy n°13 | Sat Jul 11 12:47:10.25555 2020 PDT
+ 14 | Message for copy n°14 | Sun Jul 12 12:47:10.25555 2020 PDT
+ 15 | Message for copy n°15 | Mon Jul 13 12:47:10.25555 2020 PDT
+(15 rows)
+
+COPY t_cpy TO '/dev/null';
