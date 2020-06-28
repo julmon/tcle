@@ -1,0 +1,44 @@
+version: 2
+
+jobs:
+  pg12-tcle-build:
+    docker:
+      - image: julmon/tcle-ci:12
+    steps:
+      - checkout
+      - run: |
+          echo 'export PGVERSION=12' >> $BASH_ENV
+      - run: ./docker/run_build.sh
+  pg13-tcle-build:
+    docker:
+      - image: julmon/tcle-ci:13
+    steps:
+      - checkout
+      - run: |
+          echo 'export PGVERSION=13' >> $BASH_ENV
+      - run: ./docker/run_build.sh
+  pg12-tcle-tests:
+    docker:
+      - image: julmon/tcle-ci:12
+    steps:
+      - checkout
+      - run: |
+          echo 'export PGVERSION=12' >> $BASH_ENV
+      - run: ./docker/run_tests.sh
+  pg13-tcle-tests:
+    docker:
+      - image: julmon/tcle-ci:13
+    steps:
+      - checkout
+      - run: |
+          echo 'export PGVERSION=13' >> $BASH_ENV
+      - run: ./docker/run_tests.sh
+
+workflows:
+  version: 2
+  build_and_test:
+    jobs:
+      - pg12-tcle-build
+      - pg13-tcle-build
+      - pg12-tcle-tests
+      - pg13-tcle-tests
