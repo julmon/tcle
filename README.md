@@ -68,20 +68,28 @@ Once the extension compiled and installed, PostgreSQL server configured,
 regression tests can be run with `make installcheck` like this:
 ```console
 $ PG_CONFIG=/path/to/pg_config make installcheck
-/usr/local/pgsql-devel/lib/pgxs/src/makefiles/../../src/test/regress/pg_regress --inputdir=./ --bindir='/usr/local/pgsql-devel/bin'    --dbname=contrib_regression tcle
-(using postmaster on Unix socket, default port)
+...
 ============== dropping database "contrib_regression" ==============
 DROP DATABASE
 ============== creating database "contrib_regression" ==============
 CREATE DATABASE
 ALTER DATABASE
 ============== running regression test queries        ==============
-test tcle                         ... ok           95 ms
+test 001-create-extension         ... ok           47 ms
+test 002-set-passphrase           ... ok           27 ms
+test 003-create-table             ... ok           43 ms
+test 004-update                   ... ok           14 ms
+test 005-create-table-as          ... ok           21 ms
+test 006-vacuum-full              ... ok           52 ms
+test 007-drop-table               ... ok           14 ms
+test 008-fetch-by-index-scan      ... ok           33 ms
+test 009-op-class                 ... ok           18 ms
+test 010-err-set-passphrase       ... ok            7 ms
+test 011-copy                     ... ok           28 ms
 
-=====================
- All 1 tests passed. 
-=====================
-
+======================
+ All 11 tests passed. 
+======================
 ```
 
 ## Usage
