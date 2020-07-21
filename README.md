@@ -86,6 +86,7 @@ test 008-fetch-by-index-scan      ... ok           33 ms
 test 009-op-class                 ... ok           18 ms
 test 010-err-set-passphrase       ... ok            7 ms
 test 011-copy                     ... ok           28 ms
+test 012-change-passphrase        ... ok            9 ms
 
 ======================
  All 11 tests passed. 
@@ -101,7 +102,7 @@ CREATE EXTENSION tcle;
 
 2. Set a master key:
 ```sql
-SELECT tcle_set_passphrase('my private passphrase');
+SELECT tcle_set_passphrase('private passphrase');
 ```
 
 3. Table creation:
@@ -113,12 +114,25 @@ CREATE TABLE t (
 ) USING tcleam;
 ```
 
+## Key rotation
+
+Master key rotation can be achieved by executing `tcle_change_passphrase()` SQL
+function. Warning, this function cannot be called inside a transaction block.
+
+```sql
+SELECT tcle_change_passphrase('private passphrase', 'new private passphrase');
+```
+
+Table key rotation could be done by duplicating the table structure and its
+content with `CREATE TABLE .. AS` or `CREATE TABLE .. (LIKE ..)` / `INSERT`.
+Once the table has been duplicated with a new name, and its constraints,
+indexes and triggers created, table names should be swapped.
+
 ## Limitations
 
 Due to its experimental status, there are some limitations:
 
   * DO NOT USE IT IN PRODUCTION.
-  * No support for key rotation.
   * Master key passphrase could leak in PostgreSQL logs.
 
 Concept limitations:

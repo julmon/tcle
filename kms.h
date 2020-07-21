@@ -85,5 +85,9 @@ extern void RemoveDatabaseMasterKey(ShmemKMSMasterKeysLock *shmmasterkeyslock,
 									HTAB *shmmasterkeys,
 									Oid datid);
 extern bool CheckKMSMasterKey(unsigned char *master_key);
+extern void ChangeKMSMasterKey(unsigned char *master_key,
+							   unsigned char *new_master_key);
+extern void UpdateDatabaseMasterKey(HTAB *shmmasterkeys, Oid datid,
+									unsigned char new_master_key[AES_KEYLEN]);
 
 #endif

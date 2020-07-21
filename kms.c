@@ -647,6 +647,147 @@ CheckKMSMasterKey(unsigned char *master_key)
 }
 
 /*
+ * Applies master key rotation at KMS table level by reencrypting table keys
+ * with the new master key.
+ */
+void
+ChangeKMSMasterKey(unsigned char *master_key, unsigned char *new_master_key)
+{
+	int				spi_res;
+	const char	   *query;
+	bool			isNull;
+	Oid				extensionId;
+	Oid				namespaceId;
+	char		   *namespaceName;
+	SPITupleTable  *tuptable;
+	uint64			numvals;
+
+	/* Fetch extension namespace name */
+	extensionId = get_extension_oid("tcle", false);
+	namespaceId = get_extension_schema(extensionId);
+	namespaceName = get_namespace_name(namespaceId);
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		ereport(ERROR, (errmsg("tcle: could not connect to SPI interface")));
+
+	/*
+	 * Hold an exclusive lock on KMS table to prevent race condition when a
+	 * long table creation DDL transaction is running and a master key rotation
+	 * is asked in the same time. Without this exclusive lock, this situation
+	 * will lead to have the brand new table key encrypted with the previous
+	 * master key and all the other table keys encrypted with the new master
+	 * key, which is a dramatical issue because we won't be able to decrypt
+	 * all the table keys with the new master key.
+	 */
+	query = "LOCK TABLE \"%s\".tcle_table_keys IN EXCLUSIVE MODE NOWAIT";
+	spi_res = SPI_execute(psprintf(query, namespaceName), false, 0);
+
+	/* Get the list of table keys */
+	query = "SELECT nspname, relname, cipher_key "
+			"FROM \"%s\".tcle_table_keys ";
+	spi_res = SPI_execute(psprintf(query, namespaceName), true, 0);
+
+	if (spi_res != SPI_OK_SELECT)
+	{
+		SPI_finish();
+		ereport(ERROR, (errmsg("tcle: KMS table lookup failed")));
+	}
+
+	if (SPI_tuptable == NULL)
+	{
+		SPI_finish();
+		return;
+	}
+
+	tuptable = SPI_tuptable;
+#if (PG_VERSION_NUM < 130000)
+	numvals = SPI_processed;
+#else
+	numvals = tuptable->numvals;
+#endif
+	/*
+	 * For each row from KMS table we must decrypt cipher key with the old
+	 * master key and reencrypt the plain key with the new master key, BTW, a
+	 * new random IV is built.
+	 */
+	for (int i=0; i < numvals; i++)
+	{
+		Oid			   *argstypes;
+		Datum		   *values;
+		const char	   *nulls;
+		int				spi_res_upd;
+		unsigned char  *plain_key;
+		bytea		   *new_cipher_key;
+		unsigned char	iv[AES_IVLEN];
+		int				crypt_len;
+		Datum			cipher_key,
+						nspname,
+						relname;
+		const char	   *upd_query;
+
+		/* Fetch relation namespace, name and cipher key */
+		nspname = heap_getattr(tuptable->vals[i], 1, tuptable->tupdesc,
+							   &isNull);
+		relname = heap_getattr(tuptable->vals[i], 2, tuptable->tupdesc,
+							   &isNull);
+		cipher_key = heap_getattr(tuptable->vals[i], 3, tuptable->tupdesc,
+								  &isNull);
+
+		/* Decrypt table cipher key with current master key */
+		if (!DecryptKMSCipherKey((bytea *) VARDATA_ANY(cipher_key),
+								 master_key, &plain_key))
+			ereport(ERROR, (errmsg("tcle: could not decrypt table key")));
+
+		/* Generate new random IV */
+		if (!pg_strong_random(iv, AES_IVLEN))
+			ereport(ERROR, (errmsg("tcle: could not generate random AES IV")));
+
+		new_cipher_key = (bytea *) palloc(VARHDRSZ + AES_IVLEN + AES_KEYLEN
+										  + AES_BLOCKLEN);
+		memcpy(VARDATA(new_cipher_key), iv, AES_IVLEN);
+
+		/* AES encryption of the table key with new IV and master key */
+		crypt_len = AES_CBC_encrypt(plain_key, AES_KEYLEN, new_master_key, iv,
+									(unsigned char *) VARDATA(new_cipher_key)
+									+ AES_IVLEN);
+		if (crypt_len == -1)
+			ereport(ERROR, (errmsg("tcle: could not encrypt table key")));
+
+		SET_VARSIZE(new_cipher_key, crypt_len + VARHDRSZ + AES_IVLEN);
+
+		argstypes = (Oid *) palloc(sizeof(Oid) * 3);
+		values = (Datum *) palloc(sizeof(Datum) * 3);
+		nulls = NULL;
+
+		argstypes[0] = BYTEAOID;
+		argstypes[1] = NAMEOID;
+		argstypes[2] = NAMEOID;
+
+		values[0] = PointerGetDatum(new_cipher_key);
+		values[1] = CStringGetDatum(nspname);
+		values[2] = CStringGetDatum(relname);
+
+		upd_query = "UPDATE \"%s\".tcle_table_keys SET cipher_key = $1 "
+					"WHERE nspname = $2 AND relname = $3";
+
+		spi_res_upd = SPI_execute_with_args(psprintf(upd_query, namespaceName),
+											3, argstypes, values, nulls, false,
+											0);
+
+		if (spi_res_upd != SPI_OK_UPDATE)
+			ereport(ERROR, (errmsg("tcle: could not update table cipher key")));
+
+		/* Memory clean up */
+		pfree(argstypes);
+		pfree(values);
+		pfree(plain_key);
+		pfree(new_cipher_key);
+	}
+
+	SPI_finish();
+}
+
+/*
  * Get table's key from shared memory, returns true if found.
  */
 bool
@@ -763,4 +904,22 @@ RemoveDatabaseMasterKey(ShmemKMSMasterKeysLock *shmmasterkeyslock,
 	hash_search(shmmasterkeys, &hkey, HASH_REMOVE, NULL);
 
 	LWLockRelease(shmmasterkeyslock->lock);
+}
+
+/*
+ * Update database's master key from shmem hash tab. Caller is responsible of
+ * lock acquisition.
+ */
+void
+UpdateDatabaseMasterKey(HTAB *shmmasterkeys, Oid datid,
+						unsigned char new_master_key[AES_KEYLEN])
+{
+	KMSMasterKeysEntry *entry;
+	KMSMasterKeysHashKey hkey = datid;
+
+	/* Remove the entry if exists then add a new entry */
+	hash_search(shmmasterkeys, &hkey, HASH_REMOVE, NULL);
+	entry = (KMSMasterKeysEntry *) hash_search(shmmasterkeys, &hkey,
+											   HASH_ENTER, NULL);
+	memcpy(entry->master_key, new_master_key, AES_KEYLEN);
 }
