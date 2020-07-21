@@ -1,0 +1,27 @@
+SET search_path TO public, s1;
+-- Changing the passphrase is not allowed in a transaction block, an error is
+-- raised
+BEGIN;
+SELECT tcle_change_passphrase('my secret passphrase', 'new passphrase');
+ERROR:  tcle: master key rotation cannot run inside a transaction block
+ROLLBACK;
+-- First argument must be the current passphrase, an error is raised
+SELECT tcle_change_passphrase('wrong passphrase', 'new passphrase');
+ERROR:  tcle: wrong passphrase
+-- Success
+SELECT tcle_change_passphrase('my secret passphrase', 'new passphrase');
+ tcle_change_passphrase 
+------------------------
+ t
+(1 row)
+
+-- Should fail with the old passphrase
+SELECT tcle_set_passphrase('my secret passphrase');
+ERROR:  tcle: wrong passphrase
+-- Success
+SELECT tcle_set_passphrase('new passphrase');
+ tcle_set_passphrase 
+---------------------
+ t
+(1 row)
+

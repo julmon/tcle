@@ -16,7 +16,8 @@ REGRESS    = 001-create-extension \
              008-fetch-by-index-scan \
              009-op-class \
              010-err-set-passphrase \
-             011-copy
+             011-copy \
+             012-change-passphrase \
 
 PG_CONFIG ?= pg_config
 

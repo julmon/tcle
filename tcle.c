@@ -103,6 +103,7 @@ static HTAB *command_crypt_state = NULL;
 extern Datum encrypt_text_in(PG_FUNCTION_ARGS);
 extern Datum encrypt_text_out(PG_FUNCTION_ARGS);
 extern Datum tcle_set_passphrase(PG_FUNCTION_ARGS);
+extern Datum tcle_change_passphrase(PG_FUNCTION_ARGS);
 
 static bool RelationAMIsTcleam(Oid relid);
 static HeapTuple EncryptDecryptHeapTuple(HeapTuple tuple, TupleDesc tupleDesc,
@@ -154,6 +155,7 @@ PG_FUNCTION_INFO_V1(encrypt_timestamptz_out);
 PG_FUNCTION_INFO_V1(encrypt_timestamptz_recv);
 PG_FUNCTION_INFO_V1(encrypt_timestamptz_send);
 PG_FUNCTION_INFO_V1(tcle_set_passphrase);
+PG_FUNCTION_INFO_V1(tcle_change_passphrase);
 
 void
 _PG_init(void)
@@ -690,9 +692,7 @@ encrypt_timestamptz_send(PG_FUNCTION_ARGS)
 Datum
 tcle_set_passphrase(PG_FUNCTION_ARGS)
 {
-	char		   *passPhrase = PG_GETARG_CSTRING(0);
-	const uint8	   *data;
-	size_t			len;
+	char		   *passphrase = PG_GETARG_CSTRING(0);
 	pg_sha256_ctx	ctx;
 	unsigned char	buf[PG_SHA256_DIGEST_LENGTH];
 	unsigned char	master_key[AES_KEYLEN];
@@ -706,15 +706,13 @@ tcle_set_passphrase(PG_FUNCTION_ARGS)
 				(errmsg("tcle: only database owner and superusers are allowed "
 						"to set the master key")));
 
-	if (strlen(passPhrase) == 0)
+	if (strlen(passphrase) == 0)
 		ereport(ERROR, (errmsg("tcle: passphrase should not be empty")));
-
-	len = VARSIZE_ANY_EXHDR(passPhrase);
-	data = (unsigned char *) VARDATA_ANY(passPhrase);
 
 	/* Compute sha256 hash of the passphrase */
 	pg_sha256_init(&ctx);
-	pg_sha256_update(&ctx, data, len);
+	pg_sha256_update(&ctx, (unsigned char *) VARDATA_ANY(passphrase),
+					 VARSIZE_ANY_EXHDR(passphrase));
 	pg_sha256_final(&ctx, buf);
 
 	memcpy(&master_key, buf, sizeof(buf));
@@ -727,16 +725,103 @@ tcle_set_passphrase(PG_FUNCTION_ARGS)
 	 */
 	if (!CheckKMSMasterKey(master_key))
 		ereport(ERROR,
-				(errmsg("tcle: another database master key is in use")));
+				(errmsg("tcle: wrong passphrase")));
 
 	/*
-	 * Remove from shmem previous master key if any. This can ben done safely
+	 * Remove previous master key from shmem if any. This can ben done safely
 	 * because we're sure at this point that this key is not really in use.
 	 */
 	RemoveDatabaseMasterKey(shmmasterkeyslock, shmmasterkeys, MyDatabaseId);
 	/* Add the brand new master key in shmem */
 	AddDatabaseMasterKey(shmmasterkeyslock, shmmasterkeys, MyDatabaseId,
 						 master_key);
+
+	PG_RETURN_BOOL(true);
+}
+
+/*
+ * Unsecure (the passphrase could leak in logs) and temporary user function to
+ * change a master key using a passphrase.
+ */
+Datum
+tcle_change_passphrase(PG_FUNCTION_ARGS)
+{
+	char		   *passphrase = PG_GETARG_CSTRING(0);
+	char		   *new_passphrase = PG_GETARG_CSTRING(1);
+	pg_sha256_ctx	ctx;
+	unsigned char	buf[PG_SHA256_DIGEST_LENGTH];
+	unsigned char	master_key[AES_KEYLEN],
+					new_master_key[AES_KEYLEN];
+	unsigned char	*shmem_master_key;
+	shmem_master_key = (unsigned char *) palloc(AES_KEYLEN);
+
+	/*
+	 * Master key rotation could not run in a transaction block because the
+	 * shmem update part is not atomic and cannot be rollback'd.
+	 */
+	PreventInTransactionBlock(true, "tcle: master key rotation");
+
+	/*
+	 * ACL check against database: only the owner or a superuser can change a
+	 * database master key.
+	 */
+	if (!pg_database_ownercheck(MyDatabaseId, GetUserId()))
+		ereport(ERROR,
+				(errmsg("tcle: only database owner and superusers are allowed "
+						"to change the master key")));
+
+	if (strlen(passphrase) == 0)
+		ereport(ERROR, (errmsg("tcle: passphrase should not be empty")));
+	if (strlen(new_passphrase) == 0)
+		ereport(ERROR, (errmsg("tcle: new passphrase should not be empty")));
+
+	/*
+	 * Derivate master key from the passphrase by computing passphrase sha256
+	 * sum.
+	 */
+	pg_sha256_init(&ctx);
+	pg_sha256_update(&ctx, (unsigned char *) VARDATA_ANY(passphrase),
+					 VARSIZE_ANY_EXHDR(passphrase));
+	pg_sha256_final(&ctx, buf);
+	memcpy(&master_key, buf, sizeof(buf));
+
+	/*
+	 * We have to check if the given passphrase corresponds to the current
+	 * master key.
+	 */
+	if (GetDatabaseMasterKey(shmmasterkeyslock, shmmasterkeys, MyDatabaseId,
+							 &shmem_master_key))
+	{
+		if (memcmp(shmem_master_key, master_key, AES_KEYLEN) != 0)
+			ereport(ERROR,
+					(errmsg("tcle: wrong passphrase")));
+	}
+	if (!CheckKMSMasterKey(master_key))
+		ereport(ERROR,
+				(errmsg("tcle: wrong passphrase")));
+
+	/* Key derivation for the new passphrase this time */
+	memset(buf, 0, PG_SHA256_DIGEST_LENGTH);
+	pg_sha256_init(&ctx);
+	pg_sha256_update(&ctx, (unsigned char *) VARDATA_ANY(new_passphrase),
+					 VARSIZE_ANY_EXHDR(new_passphrase));
+	pg_sha256_final(&ctx, buf);
+	memcpy(&new_master_key, buf, sizeof(buf));
+
+	/*
+	 * Let's continue with master key rotation. We need to first hold an
+	 * exclusive lock on the master key residing in shmem, then apply table key
+	 * reencryption with the new master key, update the master key residing in
+	 * shmem, finally, release master key LWLock.
+	 */
+	LWLockAcquire(shmmasterkeyslock->lock, LW_EXCLUSIVE);
+	/* Apply table keys reencryption */
+	ChangeKMSMasterKey(master_key, new_master_key);
+	/* Update master key in shmem */
+	UpdateDatabaseMasterKey(shmmasterkeys, MyDatabaseId, new_master_key);
+	LWLockRelease(shmmasterkeyslock->lock);
+
+	pfree(shmem_master_key);
 
 	PG_RETURN_BOOL(true);
 }
